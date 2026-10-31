@@ -1,3 +1,6 @@
+<!-- Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # Tiled prefill: more rows per weight pass, and the same machinery for MoE and many users
 
 The question (the user, 2026-10-11): prefill, multi-user and MoE are now as important as decode.

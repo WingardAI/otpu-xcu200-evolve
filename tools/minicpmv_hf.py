@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Hugging Face's MiniCPM-V 4.7 (transformers >= 5.18, `minicpmv4_7`) on a host without the RAM for
 its experts: the reference of docs/minicpmv.md 5. The whole model is HF's own code (processor,
 vision tower, projector, canvas M-RoPE, Qwen3.5-MoE language model, generate) but every MoE

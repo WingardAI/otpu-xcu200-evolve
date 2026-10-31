@@ -1,3 +1,6 @@
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # openTPU as a Vitis RTL kernel on the Alveo U200 (docs/u200.md).
 #
 # The kernel is loaded as an xclbin over PCIe via XRT, into the shell of the official platform

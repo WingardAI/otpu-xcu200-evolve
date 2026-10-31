@@ -1,3 +1,6 @@
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Read a core kernel's bridge diagnostics (otpu_ctrl 0x028..0x02F) and optionally run a Qwen
 prompt to provoke the failure first.
 

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # The card's BPI flash over JTAG with the Vivado hardware manager (docs/flash.md, "Over JTAG").
 # Run it on the PC with the JTAG cable (the card host: native Vivado 2026.1), with no program using
 # the card:

@@ -1,3 +1,6 @@
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Off-card/card accounting probe for the resident fill: the pool's BOs and the fill, with the
 cgroup's own memory.stat and PSI sampled beside it (docs/u200.md).
 

@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // TMEM against a reference model under random traffic. Each cycle every port requests a random
 // lane set (distinct banks within a port), a random subset of units is granted (writers only
 // while their banks stay free, as the slice's arbiter does), and the reads aim mostly at words

@@ -1,3 +1,6 @@
+<!-- Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # 4-bit weights
 
 Decode is DRAM-bound: every token streams every weight once. Halving the weight bytes is the

@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """The decode loop on the card: one device run generates up to N tokens (docs/autodecode.md).
 
 The generate program of an attention bucket wraps the model's resident decode step (its step

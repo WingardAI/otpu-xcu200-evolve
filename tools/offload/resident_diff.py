@@ -1,3 +1,6 @@
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Run one prefill twice -- the ISA simulator and the card -- with the resident layout and dump
 the whole image DRAM of both, so the first differing byte says *which* buffer a resident run
 gets wrong (docs/u200.md).

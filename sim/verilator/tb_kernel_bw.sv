@@ -1,3 +1,6 @@
+// New in the XCU200 port (WingardAI, 2026) for openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // Kernel-top testbench: replays the host's AXI-Lite register sequence against the real
 // OtpuKernel + AXI memory model, with AXI4 protocol checks. This covers the layer the
 // bridge-only unit TBs miss: kernel port widths, control mux, reset, and the host order.

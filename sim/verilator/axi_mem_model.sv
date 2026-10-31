@@ -1,3 +1,6 @@
+// New in the XCU200 port (WingardAI, 2026) for openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // Simple AXI4 slave memory model for the otpu_axi_dram unit test (sim only).
 // 512-bit beats; ARLEN read bursts are honored (RLAST on the last beat, in AR order), write
 // strobes applied. Writes are still one beat per AW/W.

@@ -1,3 +1,6 @@
+// New in the XCU200 port (WingardAI, 2026) for openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // Phase 3 smoke test: load OtpuCoreKernel and read its control/CFG registers.
 #include <cstdio>
 #include <cstdint>

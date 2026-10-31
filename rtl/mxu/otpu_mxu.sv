@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // MXU, the MX column (docs/isa.md MM, docs/mx_mxu.md): streams N rows x KB blocks of weights from
 // DRAM (port B, one D-byte chunk per cycle, prefetched through a FIFO) and their scale rows (port
 // A, 32-byte lines), and reuses each chunk across up to MCOLS stationary rows held in ACT RAM. Each

@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """A MoE model (LFM2.5-8B-A1B, Qwen3.5-35B-A3B) end to end on the ISA simulator with the card's
 4 GiB of DRAM (docs/offload.md, phase 2): the card routes and computes every expert, its
 experts stream into per-layer slots through the host's server (opentpu.host.offload), and the

@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Session emdef3 (docs/offload.md 13.16): the expert-major threshold again, after emdef2. There every run was
 # token-exact and the 35B's expert-major calls gained from 45 rows on (X - P: 27 rows +0.27 s, 45 rows -0.21 s), but
 # N's 27-row layer-major call (turn 2) took +0.40 / +0.52 s against P's. On the ISA simulator N's layer-major calls run

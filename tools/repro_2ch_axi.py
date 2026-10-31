@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Sweep sim/verilator/tb_2ch_axi.sv (two DDR controllers behind two otpu_mem_ch + otpu_axi_dram)
 over controller timings, looking for the mem_ch contract violation the fp13 card image showed:
 read data on both ports in one cycle, or a beat with no read outstanding.

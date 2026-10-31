@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // openTPU ISA constants, the decoded command passed from the sequencer to the units, and the
 // memory footprints the sequencer's scoreboard uses to let units run concurrently.
 package otpu_pkg;

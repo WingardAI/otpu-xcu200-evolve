@@ -1,3 +1,6 @@
+// New in the XCU200 port (WingardAI, 2026) for openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // Unit testbench for otpu_axi_dram: native-port commands/data vs the AXI memory model.
 //   iverilog -g2012 -o /tmp/tb_axi_dram sim/verilator/tb_axi_dram.sv \
 //       sim/verilator/axi_mem_model.sv rtl/mem/otpu_axi_dram.sv && vvp /tmp/tb_axi_dram

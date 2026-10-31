@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Load the bitstream into the YPCB-00338 over JTAG.
 #
 #   ./program.sh [bitfile]                 # openFPGALoader (macOS/Linux), Xilinx Platform Cable

@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Block design "otpu_bd" for the BCU1525 (create_project.tcl; boards/ypcb-00338/vivado/bd_native.tcl
 # is its model): PCIe (XDMA, Gen3), the core clock, resets, the SYSMON, the control interconnect and
 # XDMA's DMA split onto the channels. No memory controllers: the accelerator and XDMA's DMA meet on

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Build the openTPU U200 Vitis RTL kernel (Phase 1 skeleton): package OtpuKernel as an .xo and
 # link it for xilinx_u200_gen3x16_xdma_2_202110_1.
 #

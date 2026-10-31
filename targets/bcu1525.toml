@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # The BCU1525 (Bitmain; the SQRL XCU1525 and Xilinx VCU1525 are the same board): Virtex
 # UltraScale+ VU9P, four DDR4 DIMM slots (up to 4 x 16 GB), PCIe Gen3 x16. Two slices, each on
 # two DDR4 channels through the same two-channel adapter as the YPCB slice (docs/bcu1525.md;

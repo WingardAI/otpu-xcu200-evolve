@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Bit-exact functional simulator of the openTPU ISA (docs/isa.md).
 
 It is the golden model for the RTL: after running the same program on the same DRAM images, the

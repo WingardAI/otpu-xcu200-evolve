@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Session emdef4 (docs/offload.md 13.16): the expert-major threshold's swap check, short. emdef3 was token-exact and
 # the 35B passed; the 26B's first turn (21 rows, layer-major in both arms) took +0.20 / +0.14 s against P, with the
 # same requests (the host served them 3-8% slower in N; on the ISA simulator N's and P's layer-major calls run the

@@ -1,3 +1,6 @@
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Simulated switching activity of the U200 core kernel (the power proxy): an idle window (the
 machine halted, nothing to do) and a busy window (the demo program running), each as a VCD, plus
 the per-block value-change counts.

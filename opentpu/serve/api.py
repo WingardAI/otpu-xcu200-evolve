@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """otpu-serve: an OpenAI-style HTTP API for one model on openTPU (docs/serve.md).
 
     otpu-serve --model qwen3 --backend board            # http://127.0.0.1:8000/v1

@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Mixture-of-experts FFN with its experts streamed into a DRAM cache: path (a) of
 docs/offload.md. The card routes and computes every expert; opentpu.host.offload's server only
 moves experts into per-layer LRU slots in the card's DRAM and keeps the directory.

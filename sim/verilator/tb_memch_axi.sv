@@ -1,3 +1,6 @@
+// New in the XCU200 port (WingardAI, 2026) for openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // Integration test: otpu_mem_ch (the real channel bridge) + otpu_axi_dram + AXI memory model.
 //   iverilog -g2012 -o /tmp/tb_memch_axi sim/verilator/tb_memch_axi.sv \
 //       sim/verilator/axi_mem_model.sv rtl/mem/otpu_axi_dram.sv rtl/shell/otpu_mem_ch.sv

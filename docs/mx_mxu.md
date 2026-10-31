@@ -1,3 +1,6 @@
+<!-- Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # MX MXU: accumulate in the column, scales as shifts, one epilogue per output
 
 Question (the user, 2026-10-11): "pumped MXU with systolic and MX (verify how we could make

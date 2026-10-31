@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Session hostr21: the host release batch host-r21 (MiniCPM-V, the pool's warm gate, S = the shared expert beside the
 # request, chatmoe's pool residency, qual.sh's ECC_EACH) qualified on production's bitstream b10245f5 as loaded (no JTAG
 # load, LOAD=0; production stays on the card), under ONE otpu-lock. Its deploy directory D

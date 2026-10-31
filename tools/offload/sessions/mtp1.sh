@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Session mtp1 (docs/offload.md 15.6): the MoE MTP loop on the card, production's host against les-mtp's with --mtp on
 # production's bitstream. les-mtp = release-2's r2 (4ead4e53) + S (the shared expert beside the request, les1: -4.09 ms a
 # token) + the MTP drafter on the streamed 35B: each decode iteration one verify run of the token and its draft

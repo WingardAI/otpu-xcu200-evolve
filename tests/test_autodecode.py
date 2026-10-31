@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """The on-card decode loop's ISA (docs/isa.md): VOP ARGMAX, RLD and HALT CHAIN on the ISA
 simulator."""
 import time

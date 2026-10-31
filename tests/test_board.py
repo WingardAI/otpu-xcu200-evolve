@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """The host driver (opentpu/host/board.py) and the board model (sim/verilator/tb_board.sv).
 
 The address-map tests are pure Python. The others drive the Verilator model of the board --

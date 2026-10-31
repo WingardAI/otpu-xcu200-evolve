@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # EXPERIMENTAL (docs/mx_mxu.md): out-of-context synthesis + implementation of the MX MXU
 # experiment's tops (mx_top: the MX datapath; base_top: today's) on one part. Vivado on the build host:
 #   vivado -mode batch -nojournal -source rtl/exp/mx_mxu/ooc.tcl -tclargs <out> <top> <fam> \

@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # PCIe Gen2 (PCIE_GEN 2), on the routed design (build.tcl sources it after open_run impl_1;
 # reads $out): the PCIe block's 500 MHz user clock (userclk1) times its paths into its own TX / RX
 # block RAMs, which the IP's XDC places next to PCIE_X0Y0, so they are route only and neither

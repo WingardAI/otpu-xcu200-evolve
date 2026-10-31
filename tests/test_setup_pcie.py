@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """setup_pcie.sh --rescan's link recovery (opentpu/host/pcie/relink.sh) on a fake sysfs with a
 fake setpci: the plain remove + rescan first, and only when the card is not back, Retrain Link,
 then Link Disable, then a secondary bus reset on its upstream port, with a rescan after each; the

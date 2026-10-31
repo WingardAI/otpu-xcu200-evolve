@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # EXPERIMENTAL (docs/mx_mxu.md): tb_mx (mx_top, NCOL 2, E 2) in xsim on the unisim models, for
 # one family: x7 (pumped DSP48E1s, MMCME2_ADV) or us (packed DSP48E2s). Vivado's simulator: on
 # the build host only (never on the Mac). Usage, from the tree's root:

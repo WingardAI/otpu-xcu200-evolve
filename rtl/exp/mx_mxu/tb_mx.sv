@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // EXPERIMENTAL (docs/mx_mxu.md): xsim testbench of mx_top on the unisim DSP models (7-series
 // pumped DSP48E1s or UltraScale+ packed DSP48E2s: the family file compiled with it). Random rows
 // of 1..8 blocks: int8 / int4 / E2M1 weights (both streams), random scale words (dw, 6-bit m_b),

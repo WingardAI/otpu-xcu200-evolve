@@ -1,3 +1,6 @@
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Package the openTPU U200 kernel (OtpuKernel) as a Vitis .xo.
 #
 #   vivado -mode batch -source package_kernel.tcl -tclargs \

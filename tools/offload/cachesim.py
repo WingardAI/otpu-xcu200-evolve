@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Expert-cache hit rates on router traces (tools/offload/router_trace.py; docs/offload.md).
 
     python3 tools/offload/cachesim.py TRACE.npz [TRACE.npz ...] [--frac 0.1,0.2,...]

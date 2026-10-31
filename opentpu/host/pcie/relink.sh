@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # shellcheck shell=bash disable=SC2154,SC2086   # pci and state come from the caller; port lists split
 # Link recovery for setup_pcie.sh --rescan, sourced by it (and by tests/test_setup_pcie.py, with
 # a fake sysfs and a fake setpci). The caller sets pci (the sysfs PCI bus directory) and state

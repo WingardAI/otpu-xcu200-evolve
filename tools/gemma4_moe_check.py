@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Gemma 4 26B-A4B's MoE block on the ISA simulator against float, layer by layer, on real
 activations: moe.moe_ffn alone (one program per token and layer, the experts served into the
 image's slots by the host's server, the production flags from the environment), on the inputs

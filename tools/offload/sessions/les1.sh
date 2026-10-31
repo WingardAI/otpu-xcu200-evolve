@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Session les1 (docs/offload.md 15.4): what LES gives the card, production's host against les's on production's
 # bitstream. les = release-2's r2 (4ead4e53) + two host changes, both bit for bit:
 #   S  the shared expert beside the request (moe.moe_ffn / moe_ffn_rows): Qwen3.5-MoE only, its programs change;

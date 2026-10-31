@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // Collective unit: BAR and GATHER across S slices. When every slice is waiting on the same
 // collective, GATHER streams each slice's segment, up to LANES consecutive words per cycle, and
 // broadcasts it into the TMEM of all slices at dst + s*seg + r*drs + c; then all slices are

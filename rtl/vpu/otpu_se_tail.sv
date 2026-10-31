@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // The stream engine's tail (docs/stream.md, sections 4 and 8): every stage of a stream after
 // REDUCE A, L = LANES words (one segment) per cycle. It is DSTEP's datapath (otpu_dstep)
 // without dot A: A runs on the VPU's slot-0 partial loop and folding tree (otpu_vpu), which

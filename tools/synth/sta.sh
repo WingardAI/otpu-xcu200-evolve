@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Synthesize one module for the xc7 fabric with yosys (+slang) and report its size and the
 # longest logic path. usage: sta.sh <outdir> <top> "<-G P=V ...>" <files...>
 # Prints: <top> arrival=<ps> luts=.. ff=.. dsp=.. bram36=.. bram18=.. lutram=..

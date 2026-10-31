@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # openTPU on the Alveo U200 (XCU200) -- see docs/u200.md.
 #
 #   make kernel    OtpuKernel (registers + a scratch AXI master):     boards/u200-vitis/build.sh

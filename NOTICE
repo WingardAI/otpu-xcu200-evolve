@@ -1,0 +1,82 @@
+openTPU XCU200 port
+====================
+
+This repository is a port of openTPU to the Xilinx Alveo U200 (XCU200) platform.
+
+
+Original project
+----------------
+  openTPU — an open-source AI accelerator, developed by AI
+  https://github.com/FeSens/openTPU
+
+  Copyright the openTPU authors.
+  Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+
+This derivative work
+--------------------
+  Copyright 2026 WingardAI.
+
+  This derivative work includes modifications for the XCU200.
+  Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+
+Changes in this port
+--------------------
+The port keeps openTPU's architecture, instruction set, simulator, compiler and
+host software, and re-targets the hardware to the Alveo U200:
+
+  * rtl/boards/u200-vitis/, boards/u200-vitis/ — the Vitis RTL kernel and its
+    shell integration (XDMA, four DDR4 MIG controllers, AXI4 memory path).
+  * rtl/mem/otpu_axi_dram.sv — an AXI4 master in place of the LiteDRAM core.
+  * opentpu/host/xrt.py, xrt_shim.cpp, libotpu_xrt.so — the XRT transport.
+  * targets/u200.toml, targets/u200-vitis.toml, targets/u200-vitis-moe.toml —
+    U200 build targets.
+  * sim/verilator/tb_*axi*.sv, axi_mem_model.sv — AXI memory testbenches.
+  * tools/power_*.tcl, power_monitor.py, area_report.py, diag_bridge.py — U200
+    power, area and debug tooling.
+  * docs/u200.md, U200_RUN_NOTES.md — the U200 board guide and bring-up notes.
+
+Portions of the existing tree were modified to support that target; the
+per-file notices described below identify them.
+
+
+Per-file notices
+----------------
+In accordance with section 4(b) of the Apache License 2.0, files added or
+modified by this port carry a short notice in a comment at the top of the file:
+
+  "Modified for the XCU200 port (WingardAI, 2026) from openTPU, ..."
+  "New in the XCU200 port (WingardAI, 2026) for openTPU, ..."
+
+Files that already carried their own upstream copyright or license headers keep
+those headers unchanged; the port's notice is added alongside them, never in
+place of them. Two such cases are worth naming:
+
+  * tools/litedram/*.py — derived from LiteDRAM, BSD-2-Clause, with the
+    original copyright notices retained in their docstrings.
+  * boards/bcu1525/constraints/*.xdc and boards/bcu1525/scripts/gen_pins.py —
+    generated from AMD XilinxBoardStore pin data (Copyright 2023 Advanced Micro
+    Devices, Inc., Apache License 2.0).
+
+Generated files carry no notice of their own, because they are outputs of
+checked-in generators and are marked "do not edit" at the top:
+
+  * boards/bcu1525/constraints/bcu1525_pins.xdc (gen_pins.py)
+  * rtl/boards/ypcb-00338/otpu_fpga_top_ld.sv
+
+Data and vendor configuration files carry no notice either, because their
+formats do not admit comments: *.json, *.jsonl, *.xci, *.xml, and the compiled
+opentpu/host/libotpu_xrt.so. Their provenance is the port's and openTPU's, as
+described here.
+
+
+Third-party components
+----------------------
+  * LiteDRAM — Copyright the LiteDRAM/Migen/LiteX authors, BSD-2-Clause.
+    Present as tools/litedram/ (Python generators) and as the generated
+    boards/*/litedram/*.v.
+  * AMD XilinxBoardStore pin data — Copyright 2023 Advanced Micro Devices, Inc.,
+    Apache License 2.0. Used by boards/bcu1525/scripts/gen_pins.py.
+  * asic/nangate45/openlayout/skills/LICENSE — GNU General Public License v3.0,
+    governing that directory.

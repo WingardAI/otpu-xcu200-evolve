@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """tools/asic/flow.py and paths.py without OpenROAD: the design points come from the targets and
 name only otpu_asic_top's parameters; the constraints; native ORFS or Docker, and prep's yosys; the
 paths' units, stages and kinds."""

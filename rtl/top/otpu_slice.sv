@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // One openTPU slice: sequencer (dispatch window + scoreboard), DMA, MXU + ACT RAM, quantizer,
 // VPU and TMEM. Units run concurrently. Shared resources are arbitrated every cycle:
 //   TMEM   each bank serves 3 reads + 1 write per cycle; units are granted all-or-nothing in

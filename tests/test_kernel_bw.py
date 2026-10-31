@@ -1,3 +1,6 @@
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Kernel-top bandwidth regression: OtpuKernel + AXI memory model.
 
 Replays the host AXI-Lite register sequence (soft reset, base, mode, write/read, n, start,

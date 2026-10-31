@@ -1,3 +1,6 @@
+<!-- Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # Gemma 4 on openTPU (gemma-4-E2B-it)
 
 openTPU runs a fourth model family: Google's Gemma 4, checked with

@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // TMEM: fp32 scratchpad organised as LANES banks (bank = word address mod LANES). Units present
 // lane-wide requests on their own ports; the slice's arbiter grants each unit all-or-nothing
 // per cycle so that no bank takes more than WPB writes (and RPB reads) per cycle, and a unit

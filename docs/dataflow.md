@@ -1,3 +1,6 @@
+<!-- Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # Dataflow: where the bytes go, and folding the VPU into the MXU
 
 Question (the user, 2026-10-12): "Can we fold the VPU into the MXU without compromising on the

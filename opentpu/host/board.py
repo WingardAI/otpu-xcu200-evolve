@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Host driver for the openTPU board (YPCB-00338 over PCIe, Xilinx XDMA).
 
 The card exposes, through the XDMA bridge:

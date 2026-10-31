@@ -1,3 +1,6 @@
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Probe the resident pool's window pages, one page at a time (docs/u200.md).
 
 The `pool` selftest stage failed on the card and could not say which page broke: this tool

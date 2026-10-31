@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """otpu-selftest: staged bring-up of the openTPU card (or of its Verilator model with --sim).
 
     otpu-selftest                         # the card, /dev/xdma0

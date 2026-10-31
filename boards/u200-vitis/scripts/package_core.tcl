@@ -1,3 +1,6 @@
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Package the openTPU U200 core kernel from a source file list.
 #   vivado -mode batch -source package_core.tcl -tclargs \
 #     <filelist> <packaged_dir> <temp_project> <kernel_xml> <xo> <kernel_name> <part>

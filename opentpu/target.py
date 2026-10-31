@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Targets: one file per device, `targets/<name>.toml` (docs/targets.md).
 
 A target describes one build of openTPU in four layers:

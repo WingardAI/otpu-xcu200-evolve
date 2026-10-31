@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Session emc1 (docs/offload.md 13.18): expert-major's passes of C entries on the MX host. The expert run's passes
 # take C = 4 entries of an expert on the card (moe.em_pass_rows: MCOLS 4 with PAIR, an expert's last pass of 1-2
 # entries at PAIR's rate), today's take 2; each row's math is the same (the MX MXU's integer sums), so the tokens

@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // One DDR3 channel's user side: the accelerator's native master (otpu_native_dram, core clock,
 // one 64-byte beat per command) and XDMA's AXI master (host loads and reads, axi_aclk, 128-bit)
 // onto the two native ports of the channel's controller (uclk: LiteDRAM's sys). With

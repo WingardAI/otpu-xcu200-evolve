@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Formal equivalence of the board's glue at one slice: otpu_board + otpu_ctrl at git revision REV
 # against the worktree's, with the YPCB build's parameters, the units they instantiate (the slice,
 # the DRAM adapter, the collective unit, the trace buffer) cut out as black boxes and their ports

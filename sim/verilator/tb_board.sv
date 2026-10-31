@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // Board-level simulation: otpu_board (control registers, S slices, each with the native DRAM
 // adapter) in front of the channels' memory holding their physical images (ch0.bin, ch1.bin; slice
 // s's are ch<2s>.bin and ch<2s+1>.bin): MEM_NATIVE 2 (the

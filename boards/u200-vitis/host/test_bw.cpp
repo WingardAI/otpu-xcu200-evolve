@@ -1,3 +1,6 @@
+// New in the XCU200 port (WingardAI, 2026) for openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // On-card bandwidth test for the otpu_axi_dram bridge in OtpuKernel.
 //
 //   g++ -std=c++17 -O2 -I/opt/xilinx/xrt/include host/test_bw.cpp \

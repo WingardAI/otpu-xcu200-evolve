@@ -1,3 +1,6 @@
+<!-- Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # TMEM study: fewer copies, pumped copies, more words
 
 Status: an experiment (2026-10-11 and 12), on branch `worktree-agent-ab3fe74f4336cefb9`. Nothing

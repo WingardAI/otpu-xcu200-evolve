@@ -1,3 +1,6 @@
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # ---------------------------------------------------------------------------------------------
 # Force the implementation clock period to the frequency we actually want.
 # v++ 2024.2 writes the impl clock through write_user_impl_clock_constraint, which asks the

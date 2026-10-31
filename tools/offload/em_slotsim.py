@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Decode slot hits after a prompt, by the slots' state at the prompt's end (docs/offload.md 13.18).
 
 Offline, on offload's router traces (~/otpu-build/offload/traces on the build host: <model>.<text>.npz, each MoE

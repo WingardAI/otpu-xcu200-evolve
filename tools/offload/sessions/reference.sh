@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # The ISA simulator's reference for card runs (docs/offload.md 10): moe_card on the simulator with
 # the card's generate loop, slots and configuration (REFCFG: tools/qual/refs.py cfg on the card's
 # host), on a host with the whole pool (the 26B's: 77 min on the build host; its prefill steps a token at

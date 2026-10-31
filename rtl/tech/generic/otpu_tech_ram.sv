@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // The technology RAMs, behavioural (rtl/tech/generic): Verilator, yosys and the FPGA flows infer
 // them; rtl/tech/asic/otpu_tech_ram.sv has the same modules on SRAM macros. Every large memory of
 // the core goes through one of these, so a target's file list picks the cells

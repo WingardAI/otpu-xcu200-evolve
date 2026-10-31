@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Run a heavy Qwen workload N times on a given image and report pass/fail, the measured clock and
 the die temperature -- the comparison fp13 (WNS +0.015 ns) and fp14 (133.33 MHz) need.
 

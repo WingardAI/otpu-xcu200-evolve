@@ -1,3 +1,6 @@
+<!-- Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # Host PC: driving the openTPU card over PCIe
 
 The YPCB-00338 card runs the accelerator behind a Xilinx XDMA PCIe bridge (Gen2 x8; Gen1 x8 on

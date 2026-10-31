@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Lookahead expert scheduling (LES, OpenBMB's llama.cpp-omni) on path (a): how well the next
 layer's experts can be predicted, and what prefetching them would buy on the card (docs/offload.md
 15). Offline, on offload's router traces (tools/offload/router_trace.py; ~/otpu-build/offload/traces

@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Create the Vivado project for openTPU on the BCU1525 (xcvu9p-fsgd2104-2L-e; docs/bcu1525.md): the
 # four DDR4 channels' LiteDRAM cores (boards/bcu1525/litedram/otpu_ld4.v, one instance per channel),
 # the block design (bd.tcl: XDMA Gen3, the core clock, the SYSMON) and the board top

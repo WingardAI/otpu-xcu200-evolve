@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // Quantizer for QACT (TMEM rows -> ACT RAM) and QST (TMEM rows -> DRAM bytes), docs/isa.md
 // "Quantization": per row (x after the optional RSCALE / CSCALE factors) amax = max|x|, the row's
 // S = amax/127 and inv = 127*recip(amax); per group g (QACT: the sub-blocks of D/4 elements, QST:

@@ -1,3 +1,6 @@
+// New in the XCU200 port (WingardAI, 2026) for openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // openTPU's memory controller, replaced by an AXI4 master on the Alveo U200 (docs/u200.md).
 // It sits where the LiteDRAM core (otpu_ld4) sat: on
 // otpu_mem_ch's controller side (c_*, uclk), two native ports (bank parity 0 and 1, one 64-byte

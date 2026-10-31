@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Targets (opentpu/target.py, targets/*.toml) and the configuration registers (register map 4):
 the loader, board_config from the selected target, the arch hash, the FPGA flow's generics
 matching the RTL's defaults, and the host building its Config from the device."""

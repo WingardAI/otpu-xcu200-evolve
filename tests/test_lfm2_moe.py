@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """LFM2-MoE on openTPU with its experts streamed into DRAM slots (docs/offload.md, path (a)):
 the card routes and computes every expert, the host's server moves the missing ones. A tiny
 random model against Hugging Face transformers and the quantized emulation; a small cache

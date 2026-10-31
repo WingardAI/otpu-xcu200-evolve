@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // Slice DRAM ports (as otpu_dram) on the two DDR3 channels' native ports, 512-bit data: one
 // command per 64-byte beat (LiteDRAM's native port behind otpu_mem_ch; docs/litedram.md section
 // 3). The slice side, the address map and the behaviour are those of otpu_axi_dram, the MIG AXI

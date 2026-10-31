@@ -1,3 +1,6 @@
+<!-- Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # LiteDRAM instead of the MIG: an assessment (draft)
 
 Draft, 2026-09-29. This is an investigation; the design is unchanged. Labels: **measured** means

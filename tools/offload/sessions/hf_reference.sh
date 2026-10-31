@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Hugging Face's greedy tokens for card runs (bf16 on the CPU, moe_card --hf): the prompt and the
 # 8 best logits a step, on a host with the whole checkpoint (the 26B's: the build host, 8 GiB of weights
 # in RAM and the rest from disk). A checkpoint without a chat template takes the prompt as plain

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Where the area goes on the U200: per SLR, and per part (the routed utilization reports).
 
     tools/area_report.py [--slr RPT] [--hier RPT] [--svg OUT]

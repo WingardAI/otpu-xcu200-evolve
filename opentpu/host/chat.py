@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """otpu-chat: chat with Qwen3 (or LFM2, or Qwen3.5) running on openTPU.
 
     otpu-chat                                 # ISA simulator (~3 s/token on a laptop)

@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Gemma 4 on openTPU: sliding and global attention with a KV ring and shared KV layers, GeGLU,
 per-layer embeddings gathered on the device, against Hugging Face transformers. A tiny random
 model always runs; the real model's programs are compiled when its config is in

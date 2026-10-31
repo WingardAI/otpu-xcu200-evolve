@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """The BCU1525's pin constraints (boards/bcu1525/constraints/*.xdc) from AMD's VCU1525 board files.
 
 The BCU1525 (Bitmain) and XCU1525 (SQRL) are builds of Xilinx's VCU1525 (docs/bcu1525.md): the pins

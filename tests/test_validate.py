@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """tools/validate.py: the CPU golden (Hugging Face with openTPU's quantization) against the ISA
 simulator on tiny random models of each port, and the comparisons that judge a device: the
 golden's weights are the image's, a 1-ulp or one-token difference between two devices fails,

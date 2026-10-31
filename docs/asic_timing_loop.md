@@ -1,3 +1,6 @@
+<!-- Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # The ASIC timing loop: RTL and physical design together
 
 A loop for closing an ASIC block's clock the way a real design team does it: change the RTL, run

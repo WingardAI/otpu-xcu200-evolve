@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // The accelerator as built for the PCIe boards: S slices (one on the YPCB-00338, two on the
 // BCU1525), each with its DRAM adapter otpu_native_dram onto two memory channels' native ports
 // n_* (one command per 64-byte beat, for otpu_mem_ch in front of LiteDRAM's native port: slice

@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Session mcpv2 (docs/minicpmv.md 6): MiniCPM-V 4.7 (35B-A3B) on the card, where the time goes and the staged vision.
 # mcpv1 passed (text, thumb, serve token-exact) with thumb's one crop at 30.3 s of vision, otpu-serve's image TTFTs at
 # 16.6 / 15.5 s and text's first turns cold (its image's first build, 200.8 s at a 28.4 GB peak of the host's 31 GB,

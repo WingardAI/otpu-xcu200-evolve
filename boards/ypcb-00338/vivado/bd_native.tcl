@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Block design "otpu_bd" for the YPCB-00338 (create_project.tcl): PCIe (XDMA), the core clock,
 # resets, the XADC and the control interconnect. No memory controllers and no memory
 # interconnect: the accelerator (otpu_board) and XDMA's DMA meet on each channel in otpu_mem_ch

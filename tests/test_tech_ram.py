@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """The technology RAMs (rtl/tech/<family>/otpu_tech_ram.sv): the ASIC's, tiled onto SRAM macros
 (tools/asic/fakeram.py's models, the leaves from tools/asic/flow.py), read what the generic,
 inferred ones read, cycle for cycle, under random traffic (sim/tech/tb_tech_ram.sv): width tiles,

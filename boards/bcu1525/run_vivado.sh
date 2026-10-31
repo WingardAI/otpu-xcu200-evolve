@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Build the openTPU bitstream for the BCU1525 (xcvu9p-fsgd2104-2L-e) in Vivado batch mode
 # (docs/bcu1525.md). The knobs, as boards/ypcb-00338/run_vivado.sh's:
 #   S=2 MCOLS=4 VPU_CL=2 LANES=8 ACT_ROWS=MCOLS DSTEP=1   the accelerator (S slices, two DDR4 channels each)

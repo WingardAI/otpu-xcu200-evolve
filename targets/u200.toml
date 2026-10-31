@@ -1,3 +1,6 @@
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # The Alveo U200 (Xilinx; board part xcu200-fsgd2104-2-e): the retail VCU1525 board (the
 # BCU1525's platform) with production silicon. Same package (fsgd2104), pinout (au200's
 # part0_pins.xml == vcu1525's, checked) and DIMMs (MTA18ASF2G72PZ-2G3, DDR4-2400, x4, ECC) as

@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Session mtps (docs/offload.md 15.6): otpu-serve with and without --mtp on the streamed 35B, for MTP by default in the
 # server. Both arms from this tree (T: serve-mtp), so only --mtp differs: A = otpu-serve from production's pool (O/QA,
 # card2's checkpoint), B = otpu-serve --mtp from the MTP pool (QM, mtp1's checkpoint MDB). Each run: the arm's pool read

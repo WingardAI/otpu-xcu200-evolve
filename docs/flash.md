@@ -1,3 +1,6 @@
+<!-- Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # The configuration flash (draft)
 
 Draft, 2026-09-28. Two parts: writing the card's flash over JTAG now, so that the production

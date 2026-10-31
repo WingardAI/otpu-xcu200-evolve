@@ -1,3 +1,6 @@
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Power analysis of the openTPU U200 core kernel, offline (no card, no xclbin).
 #
 #   vivado -mode batch -nojournal -log <out>/power.log -source tools/power_core.tcl \

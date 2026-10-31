@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # EXPERIMENTAL (docs/vpu_pump.md): the experiment's Vivado runs, one after another (the build host only,
 # through ~/otpu-build/slot.sh). Usage, from the tree:
 #   rtl/exp/vpu_pump/run_ooc.sh <outdir> [step ...]

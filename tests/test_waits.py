@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """opentpu.waits: the compiler's wait entries for otpu_seq WAITC (docs/isa.md "Wait counts")."""
 import numpy as np
 import pytest

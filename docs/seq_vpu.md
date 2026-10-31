@@ -1,3 +1,6 @@
+<!-- Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # The sequencer and the VPU: where the area goes, and what can give it back
 
 Question (the user, 2026-10-12): where is the design bottlenecked, and is there an architecture

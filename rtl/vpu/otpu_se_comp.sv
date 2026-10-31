@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // The stream engine's composite functions (docs/stream.md section 11, SE v2): EXP2, EXP2SUB,
 // RECIP, RSQRT and LOG2 on all LANES lanes, microcoded over NS generic multiply-add stages per
 // lane (in SE: VPU slot 0, the tail's U and the tail's Q). Each function is its op list from

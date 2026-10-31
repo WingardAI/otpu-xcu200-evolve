@@ -1,3 +1,6 @@
+<!-- Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # Weight formats per layer
 
 Decode streams every weight once per token, so a model's decode speed follows its weight bytes:

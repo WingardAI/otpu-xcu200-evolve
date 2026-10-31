@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # EXPERIMENTAL (docs/vpu_pump.md): out-of-context synthesis + implementation of otpu_vpu (the VPU
 # with the stream engine's core side, otpu_se_comp and otpu_se_tail) on the YPCB's part, at one
 # clock. Vivado on the build host only:

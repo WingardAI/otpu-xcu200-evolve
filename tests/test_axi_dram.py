@@ -1,3 +1,6 @@
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """otpu_axi_dram (the U200 native-port -> AXI4 bridge): unit and otpu_mem_ch integration tests.
 
 The testbenches are small self-checking SV programs run with iverilog/vvp (no Verilator model

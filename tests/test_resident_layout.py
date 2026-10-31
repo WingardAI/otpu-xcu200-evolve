@@ -1,3 +1,6 @@
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """The resident layout (docs/u200.md): every layer's slots at the same address,
 the window each layer's page is reached through, and the fill that puts the experts there.
 

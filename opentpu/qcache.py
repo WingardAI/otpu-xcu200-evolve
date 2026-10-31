@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """A disk cache of the 4-bit weight quantizer's results, so a model's DRAM image builds in a
 minute once its matrices have been quantized (a 4-bit Qwen3.5-4B takes ~20 minutes of numpy on
 the card host, and every card tool built it again under the card lock).

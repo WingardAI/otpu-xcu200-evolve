@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // LD / ST: move 32-bit words between the slice DRAM and TMEM using the DRAM burst port (B).
 // DRAM side: every D-byte chunk the transfer touches is requested once (B requests are chunk
 // aligned). TMEM side: the transfer is cut into W = min(D/4, LANES)-word segments aligned in

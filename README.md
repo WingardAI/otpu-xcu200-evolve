@@ -2,6 +2,12 @@
 
 **An open-source AI accelerator, developed by AI.**
 
+> **Port notice.** This project is a port of openTPU to the XCU200 platform.
+> Original work is Copyright the openTPU authors and licensed under the Apache
+> License 2.0. See the [LICENSE](LICENSE) file for details. This derivative work
+> includes modifications for the XCU200. See [NOTICE](NOTICE) for the attribution
+> and the list of changes.
+
 openTPU brings the lessons of [auto-arch-tournament](https://github.com/FeSens/auto-arch-tournament)
 to AI accelerators. It asks two questions: how far can AI agents go at hardware design, and can
 they build the chip that runs their own inference?
@@ -342,6 +348,17 @@ Issues and pull requests are welcome, and most of the work needs only Python and
 an FPGA. Changes to the ISA, the simulator or the RTL must keep `python3 -m pytest -q` passing,
 and performance claims should say how they were measured.
 
-## License
+## Attribution and license
 
-Apache License 2.0. See [LICENSE](LICENSE).
+This repository is a port of [openTPU](https://github.com/FeSens/openTPU) to the
+XCU200 (Xilinx Alveo U200) platform.
+
+- **Original work:** openTPU, Copyright the openTPU authors, Apache License 2.0.
+- **This derivative work:** Copyright 2026 WingardAI, Apache License 2.0, with
+  modifications for the XCU200.
+
+See [LICENSE](LICENSE) for the full license text, and [NOTICE](NOTICE) for the
+attribution, the description of the changes, and the third-party components.
+Files added or modified by the port carry a short modification notice in a
+comment at the top; the upstream copyright and license headers are preserved as
+they were.

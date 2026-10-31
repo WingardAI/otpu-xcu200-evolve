@@ -1,3 +1,6 @@
+<!-- Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # A 2D systolic MXU (`MXU_IMPL=2`)
 
 Goal: an MXU that scales to MCOLS = 8 (4 and 12 must also build) on the xc7k480t without the

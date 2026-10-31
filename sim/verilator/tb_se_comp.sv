@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // Unit test of rtl/vpu/otpu_se_comp.sv (tests/test_se_comp.py): chunks of composite functions
 // issued the way the VPU issues them (a decision HA cycles before S0, held by `hold`; the
 // latency rule: a chunk never enters while chunks with more passes are in flight), with

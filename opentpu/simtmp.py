@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Temporary directories of the simulators: rtlsim's runs (otpu_*), the board model's
 (otpu_board_*) and the tools' (otpu_bench_, otpu_prefill_, otpu_ddr_). A run's DRAM images are
 up to gigabytes, so:

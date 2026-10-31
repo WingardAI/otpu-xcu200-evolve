@@ -1,3 +1,6 @@
+// New in the XCU200 port (WingardAI, 2026) for openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // Two DDR controllers, as the U200 core kernel's SLR1 has them: one otpu_mem_ch + one
 // otpu_axi_dram + one AXI DDR model per channel (0 and 1), both channels driven together the way
 // the board's slice drives them (a stream of commands per channel, read data consumed in order),

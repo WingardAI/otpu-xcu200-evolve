@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """ISA-simulator references for the card qualification's token-exact checks, cached by content.
 
     python3 tools/qual/refs.py cfg OUT.pkl [--name NAME]    the card's configuration (registers)

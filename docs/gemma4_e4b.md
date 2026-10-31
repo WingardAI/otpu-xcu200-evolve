@@ -1,3 +1,6 @@
+<!-- Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # Gemma 4 E4B: the per-layer embeddings from the host
 
 otpu-chat's `gemma4-e4b` is the instruct checkpoint, gemma-4-E4B-it, since 2026-10-09 (the same

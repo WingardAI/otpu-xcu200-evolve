@@ -1,3 +1,6 @@
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Post-route diagnostics (only when OTPU_DIAG is set to a file prefix).
 # Writes the top failing/near-critical kernel paths and a per-region utilization dump so the
 # next floorplan iteration can see *which* structures (wide LUTRAM FIFOs, bridges, board) are

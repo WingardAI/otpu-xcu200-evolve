@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // Asynchronous FIFO, first-word fall-through: gray-coded pointers, each synchronized by two
 // flip-flops into the other clock, and a distributed-RAM array (asynchronous read), so rdata is
 // the head entry while rvalid is high. DEPTH is a power of two.

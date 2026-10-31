@@ -1,3 +1,6 @@
+<!-- Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # openTPU on the Inspur YPCB-00338
 
 The board build: one openTPU slice (D = 128, 4 MXU columns with the systolic MXU, 8 VPU lanes,

@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """DDR3 calibration for LiteDRAM's A7DDRPHY from the host (docs/litedram.md, section 7): the
 LiteDRAM test image (tools/litedram/ld_host.py) and the board's bring-up (opentpu/host/memcal.py)
 use it. Stdlib only, no package imports, so a copy next to ld_host.py works on a card

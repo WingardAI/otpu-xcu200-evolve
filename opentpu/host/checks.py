@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Bring-up checks shared by otpu-selftest and tests/test_board.py."""
 from __future__ import annotations
 

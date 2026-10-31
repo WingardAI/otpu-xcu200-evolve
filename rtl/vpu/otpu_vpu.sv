@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // VPU: LANES fp32 elements per cycle along a row of a [rows, cols] TMEM tile. Operand A from
 // read port A, operand B from read port B (full tile, per-column), one broadcast word (per-row)
 // or the scalar immediate (docs/isa.md, VOP).

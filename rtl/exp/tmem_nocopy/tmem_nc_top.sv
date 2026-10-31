@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // EXPERIMENTAL (docs/tmem_nocopy.md): the out-of-context top of the one-copy TMEM. The slice's
 // TMEM ports (otpu_slice: 8 read ports, the MXU's with the crossbar; 4 write ports) and the
 // slice's arbiter for the TMEM in question, every input registered and every output (the read

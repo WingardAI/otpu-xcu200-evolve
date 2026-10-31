@@ -1,3 +1,6 @@
+// New in the XCU200 port (WingardAI, 2026) for openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // Phase 1 host test for the openTPU U200 kernel.
 //
 //   source /opt/xilinx/xrt/setup.sh

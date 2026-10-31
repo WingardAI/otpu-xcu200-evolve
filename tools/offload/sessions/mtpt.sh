@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Session step mtpt (docs/offload.md 15.6): mtp2's TTFT left +0.10..0.13 s of B - A outside the prompt's calls in turns
 # 2-5 (mtp1c +0.13..0.16); one traced run of each arm with chatmoe --trace's host phases (tools/qual/chatmoe.py
 # _Phases: rollback, each prefill_layers and its end_prefill, the snapshot and MTP's held row's read, MTP's own prefill,

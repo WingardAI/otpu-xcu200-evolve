@@ -1,3 +1,6 @@
+<!-- Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # otpu-serve: an OpenAI-style server on the card
 
 `otpu-serve` serves one model on the card to any number of clients over an OpenAI-compatible

@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # The MXU's systolic array placed as a grid (docs/mxu_systolic.md, "Placement on the YPCB").
 # Array column j goes in one DSP column, its positions in order up the column, so position i sits
 # at the same height in every column; its column end (otpu_mxce) goes above them (OTPU_MXU_CE=mid:

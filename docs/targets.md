@@ -1,3 +1,6 @@
+<!-- Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # Targets: one design, many boards and chips
 
 openTPU builds for several targets from one source tree: the YPCB-00338 card in production, the

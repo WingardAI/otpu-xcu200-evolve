@@ -1,3 +1,6 @@
+<!-- Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # The VPU: where it binds, and whether pumping or widening it pays
 
 Question (the user, 2026-10-11): prefill, multi-user and MoE now count as much as decode. Where

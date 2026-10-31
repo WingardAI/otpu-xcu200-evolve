@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // FPGA top for the BCU1525 (VCU1525 build: xcvu9p-fsgd2104-2L-e; docs/bcu1525.md): the block
 // design otpu_bd (XDMA Gen3, the core clock, the SYSMON, the control interconnect and XDMA's DMA
 // split onto the channels: boards/bcu1525/vivado/bd.tcl), one DDR4 LiteDRAM core per DIMM

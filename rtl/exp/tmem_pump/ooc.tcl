@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # EXPERIMENTAL (docs/tmem_pump.md): out-of-context synthesis + implementation of the TMEM
 # experiment's top (tmem_pump_top) with its clocks from an MMCM. Vivado on the build host only:
 #   vivado -mode batch -nojournal -source rtl/exp/tmem_pump/ooc.tcl -tclargs <out> <VAR> \

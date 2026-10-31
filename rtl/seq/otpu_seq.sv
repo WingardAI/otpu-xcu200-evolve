@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // Sequencer: fetches and decodes one instruction per cycle. NOP, LI, ADDI and LOOP execute
 // here; every other instruction has its register-relative fields resolved and is dispatched,
 // in program order, into a window of WIN slots together with its memory footprint.

@@ -1,3 +1,6 @@
+<!-- Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # Prefill at run-time positions
 
 **Goal:** a prompt's prefill from programs compiled once per attention bucket, not once per

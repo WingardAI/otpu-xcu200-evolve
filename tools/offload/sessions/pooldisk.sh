@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Session pooldisk (docs/minicpmv.md 6): what an expert pool's disk costs a warm process, on the card host's two disks.
 # mcpv3b's dropped arms were invalid (the engine maps the pool: posix_fadvise DONTNEED left it cached); pool_disk.py now
 # releases those maps first and checks every arm with mincore. Pools (each its model's engine, otpu-chat's):

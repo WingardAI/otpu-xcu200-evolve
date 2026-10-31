@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """The workload scoreboard: what a hardware configuration gives on the four workloads the user
 weighs equally (2026-10-11): single-user decode, prefill, multi-user batched decode, MoE.
 

@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Session mtp2 (docs/offload.md 15.6): mtp1c's A / B again with the two TTFT fixes, and a traced pair. A = production's
 # host tree (PD/host: deploy_hostr21_b10245f5, d966c3df, with S), plain decode from production's pool; B = mcpv-mtp
 # (TB, its COMMIT: les-mtp's MoE MTP drafter with MiniCPM-V on main, and F1b: the loop's first run drafts the prompt's

@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """openTPU on NanGate45 with OpenROAD (docs/asic.md): the ASIC block (rtl/asic/otpu_asic_top.sv)
 through OpenROAD-flow-scripts, for PPA numbers.
 

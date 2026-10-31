@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // Host control registers (AXI4-Lite slave, reached from the host through the PCIe bridge's
 // BAR). All in the core clock domain. Register map version 5 (docs/observability.md: the
 // contract with the host); 12 address bits are decoded (the map repeats every 4 KiB).

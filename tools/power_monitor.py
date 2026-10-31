@@ -1,3 +1,6 @@
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Sample the U200's power and temperatures: a table on the terminal, a peak record at the end
 (the card is passively cooled, so the peak -- not the reading at the end of a run -- is what
 matters), or run a command between the two samples.

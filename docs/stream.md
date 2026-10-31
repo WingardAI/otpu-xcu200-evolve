@@ -1,3 +1,6 @@
+<!-- Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # The stream engine (SE): one programmable unit for the VPU and DSTEP
 
 Status: **draft spec, M1 (2026-09-29 01:30)**. It is the contract for tonight's RTL. The

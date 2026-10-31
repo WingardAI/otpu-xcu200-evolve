@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # EXPERIMENTAL (docs/mx_mxu.md): the setup slack of the MX datapath's new paths on a routed
 # checkpoint of mx_top (ooc.tcl's routed.dcp): the shift into the column ends' B ports, the
 # accumulating DSP (its OPMODE register and P), the lane's i2f48, PAIR's 48-bit add and the

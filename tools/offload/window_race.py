@@ -1,3 +1,6 @@
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Card gate, ~1 s, no model and no fill: is the window register read at every beat?
 
 The smallest question the resident layout can ask the card: is the window's value read

@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Out-of-context Vivado check of otpu_mem_ch's clock-domain crossings, with its constraints
 # (boards/ypcb-00338/constraints/otpu_mem_ch.tcl, read scoped and unmanaged as the build will):
 # synthesis, then report_cdc (with the XDC's waivers; also every check per endpoint, where the

@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Qwen3 dense decoder (e.g. Qwen3-0.6B / 1.7B) on openTPU.
 
 Pieces:

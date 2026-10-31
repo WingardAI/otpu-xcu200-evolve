@@ -1,3 +1,6 @@
+<!-- New in the XCU200 port (WingardAI, 2026) for openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # openTPU on the U200 — run notes (2026-10-31)
 
 Tree: this repository (`$PWD`). Card: Alveo U200 `[0000:01:00.1]`, shell

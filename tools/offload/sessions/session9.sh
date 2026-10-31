@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # offload card session 9 (production build B, Gen1, no reload): the experts' MMs paired (main
 # d29bfe9, moe-pair) against unpaired, in one session. Tree B is this one (d29bfe9 + this
 # script; its ISA-simulator references in RFB, made by reference.sh at d29bfe9), tree A main

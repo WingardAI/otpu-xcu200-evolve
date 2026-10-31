@@ -1,3 +1,6 @@
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Each DIMM's LiteDRAM core (otpu_ld4 u_ld0..u_ld3) has its own IDELAYCTRL, its own 300 MHz
 # reference clock and its own banks, so each needs its own IODELAY_GROUP: without one the
 # placer's DRC PLIDC-7 stops ("Design has more than one unlocked and ungrouped IDELAYCTRL

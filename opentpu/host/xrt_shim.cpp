@@ -1,3 +1,6 @@
+// New in the XCU200 port (WingardAI, 2026) for openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // ctypes shim for the parts of XRT that pyxrt 2.18 does not expose: xrt::ip (arbitrary control
 // register access) and xrt::bo (host BOs). opentpu/host/xrt.py loads this library.
 #include <xrt/xrt_device.h>

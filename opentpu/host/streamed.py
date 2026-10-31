@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """A mixture-of-experts model bigger than the card's DRAM, its experts streamed from a pool file
 on the host (docs/offload.md, path (a)): the Engine, its pool and its expert server's settings,
 as otpu-chat and tools/offload/moe_card.py build them.

@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Path (a)'s host side: the expert server (docs/offload.md section 5.2).
 
 The card computes everything: it routes, posts the ids of the experts a MoE layer needs to a

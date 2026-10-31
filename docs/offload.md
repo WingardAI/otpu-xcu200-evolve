@@ -1,3 +1,6 @@
+<!-- Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+     https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE. -->
+
 # Bigger than DRAM: MoE expert offloading
 
 Status: phase 1, a design study, revised for path (a). Nothing here has run on the card yet.

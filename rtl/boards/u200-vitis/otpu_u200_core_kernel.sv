@@ -1,3 +1,6 @@
+// New in the XCU200 port (WingardAI, 2026) for openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // openTPU on the Alveo U200 as a Vitis RTL kernel: the S = 2 accelerator (two slices, four
 // memory channels, one DDR4 controller each).
 //

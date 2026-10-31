@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # The LiteDRAM test image on the card (docs/litedram.md, section 7). On the card host
 # a JTAG load comes back on the bus only after a warm reboot (otpu-rescan's retrain did not
 # bring it back after any of the three loads so far), so a session is four steps around

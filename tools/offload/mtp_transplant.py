@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """MTP transplant (docs/offload.md 15.6): Qwen3.5-35B-A3B's MTP head (its mtp.* layer: two input
 norms, fc over [embedding, hidden], one full-attention MoE decoder layer, mtp.norm) as a k = 1
 drafter, on the base model's own hidden states and on MiniCPM-V-4.7-35B-A3B's (the same backbone

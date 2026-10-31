@@ -1,3 +1,6 @@
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Reproduce the U200 core kernel's AXI_ERR down to one instruction (docs/u200.md
 T1.2). The shell has an **AXI firewall**: `RRESP != OKAY` means it blocked a transaction it judged
 non-compliant (illegal burst/length, an address outside the port's window, a protocol violation) --

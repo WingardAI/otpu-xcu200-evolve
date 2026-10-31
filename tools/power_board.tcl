@@ -1,3 +1,6 @@
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Power analysis of the slices (otpu_board is the DUT of the board simulation, so a simulated VCD
 # annotates it one-to-one; the kernel's four otpu_mem_ch/otpu_axi_dram bridges are not in the
 # simulation's DUT -- the testbench models them -- and get the vectorless estimate).

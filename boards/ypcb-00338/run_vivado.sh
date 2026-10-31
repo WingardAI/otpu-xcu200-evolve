@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Build the openTPU bitstream for the YPCB-00338 in Vivado batch mode, natively or in Docker.
 #
 #   ./run_vivado.sh [1066]                # native: `vivado` on PATH (x86-64 Linux / Windows WSL)

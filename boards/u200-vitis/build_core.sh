@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Build the openTPU U200 core kernel (Phase 3): package OtpuCoreKernel and link the xclbin.
 #   source /path/to/Vitis/2024.2/settings64.sh
 #   boards/u200-vitis/build_core.sh

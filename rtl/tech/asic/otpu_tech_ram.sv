@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // The technology RAMs on SRAM macros (an ASIC's rtl/tech; the generic file infers the same
 // modules). Each RAM is tiled onto leaf macros of at most WMAX bits by NMAX words: width tiles side
 // by side, depth tiles (N a multiple of NMAX) with a registered read bank select. The leaves

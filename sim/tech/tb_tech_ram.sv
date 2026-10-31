@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // The technology RAMs (rtl/tech/<family>/otpu_tech_ram.sv) under random traffic: every cycle
 // after the first read prints the read data. Built once with rtl/tech/generic (inferred) and once
 // with rtl/tech/asic (tiled onto the macros' models, tools/asic/fakeram.py); tests/test_tech_ram.py

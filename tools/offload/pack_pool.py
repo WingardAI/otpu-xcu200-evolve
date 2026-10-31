@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """Pack a MoE model's expert pool file in the split format (docs/offload.md 10.1, 10.4, 11.4) from
 the whole checkpoint: in parallel workers on its host, or streamed into a pool on another host.
 

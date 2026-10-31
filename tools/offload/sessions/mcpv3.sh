@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Session mcpv3 (docs/minicpmv.md 6): MiniCPM-V 4.7 (35B-A3B) on the card with this tree's defaults:
 # the staged vision, the tower's wait entries computed ahead (opentpu/host/vision_warm.py) and the
 # faster wait analysis (waits._MemoPass). Also the sliced reference's first run, and what the pool's

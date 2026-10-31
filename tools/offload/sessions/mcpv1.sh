@@ -1,4 +1,7 @@
 #!/bin/bash
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 # Session mcpv1 (docs/minicpmv.md 6): MiniCPM-V 4.7 (35B-A3B) on the card for the first time, through otpu-chat's
 # engine and Chat (tools/qual/chatmoe.py): the language model's experts streamed from the MX pool, the vision tower
 # resident in int8 (Spec.vision_staged False), MiniCPM-V's formats (streamed.FORMATS["minicpmv"]: fp4 experts,

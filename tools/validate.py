@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """The device against a CPU golden: greedy tokens and logits of the card, the ISA simulator or
 the RTL simulator next to Hugging Face transformers running the same checkpoint in fp32 on the
 CPU with openTPU's quantization, and (--against) next to a second device.

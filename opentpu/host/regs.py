@@ -1,3 +1,6 @@
+# Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """The control register map of the board (docs/observability.md; otpu_ctrl.sv, otpu_trace.sv).
 
 Byte offsets from BAR0, 32-bit registers. Version 1 bitstreams implement 0x00..0x38 only and

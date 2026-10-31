@@ -1,3 +1,6 @@
+# New in the XCU200 port (WingardAI, 2026) for openTPU,
+# https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 """XRT transport for the U200 Vitis RTL kernel.
 
 `pyxrt` 2.18 does not expose `xrt::ip` (arbitrary control registers) or `xrt::bo`, so this

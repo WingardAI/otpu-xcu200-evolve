@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // Simulation model of the board memory behind the two channels' native ports n_*: per channel the
 // board's bridge, otpu_mem_ch, in front of either a model of LiteDRAM's two native ports
 // (otpu_ldn_model, MEM = 0) or the U200 path: otpu_axi_dram + axi_mem_model (MEM = 1), both

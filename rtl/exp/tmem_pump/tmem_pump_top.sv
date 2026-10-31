@@ -1,3 +1,6 @@
+// Modified for the XCU200 port (WingardAI, 2026) from openTPU,
+// https://github.com/FeSens/openTPU (Apache-2.0). See NOTICE.
+
 // EXPERIMENTAL (docs/tmem_pump.md): the out-of-context top of the TMEM experiment. The slice's
 // TMEM ports (otpu_slice: 8 read ports, the MXU's with the crossbar, Q3 and COLL guests on the
 // DMA's copy at IMPL 0; 4 write ports), every input registered in clk_s and every read lane's data
