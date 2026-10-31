@@ -1,0 +1,440 @@
+"""Observability on the board model (sim/verilator/tb_board.sv; docs/observability.md): the
+version 5 register map, the free-running activity counters and their snapshots, and the
+hardware trace -- whose records, decoded by opentpu/hwtrace.py, must give exactly the trace
+lines the simulator prints (+trace) for the same run.
+"""
+import re
+
+import numpy as np
+import pytest
+
+from opentpu.host.board import (CTRL_CLEAR, CTRL_RUN, R_B_RD, R_B_WR, R_CTRL, R_CYCLES, R_CYCLES_HI,
+                        R_ICOUNT, R_SCRATCH, R_STATUS, R_VERSION, ST_HALTED, Board, SimTransport)
+from opentpu.host import regs as R
+from opentpu.host.checks import PROG_AT, demo_image, demo_program
+from opentpu import isa as I
+from opentpu.hwtrace import (R_TRACE_ADDR, R_TRACE_COUNT, R_TRACE_CTRL, R_TRACE_DROP,
+                             R_TRACE_HI, R_TRACE_LO, TRACE_BUSY, TRACE_CLEAR, TRACE_ENABLE,
+                             TRACE_STOP_WHEN_FULL, records_to_trace, ring_order)
+from opentpu.kernels import attention_decode, mlp
+from opentpu.runtime import compile_kernel
+
+from conftest import sim_board_config
+from test_kernels import attn_args, mlp_args
+
+R_REGMAP, R_CAPS, R_CORE_KHZ, R_BUILD_ID, R_TEMP, R_SNAP = 0x3C, 0x40, 0x44, 0x48, 0x4C, 0x50
+R_DDR_MTS = 0x54
+COUNTERS = ["UPTIME", "RUNNING", "MXU_BUSY", "MXU_MAC", "VPU_BUSY", "QNT_BUSY", "DMA_BUSY",
+            "TMEM_DENY", "DRAM_RD", "DRAM_WR", "DRAM_WAIT", "INSTR", "MXU_STARVE"]
+TB_BUILD_ID, TB_TEMP = 0x0B0A4D00, 0xA1A        # tb_board.sv
+LINE = re.compile(r"^T\d+ [DSGEUHPQ] ")
+CFG = sim_board_config(DRAM_BYTES=1 << 22)
+
+
+def sim_lines(out: str) -> list[str]:
+    return [line for line in out.splitlines() if LINE.match(line)]
+
+
+def run_traced(t: SimTransport, img, prog: list, trace_ctrl: int = TRACE_ENABLE,
+               nrec: int = 0, snap: bool = False) -> dict:
+    """One simulation: load and run `prog`, wait for the trace to drain, read the counters and
+    the first `nrec` trace records (raw ring order)."""
+    b = Board(t, check=False)
+    img = np.asarray(img, np.uint8)
+    at = max(PROG_AT, -(-len(img) // 4096) * 4096)
+    b.write(0, img)
+    b.load(at, prog)                        # (with its wait entries where the board takes them)
+    t.reg_write(R_TRACE_CTRL, TRACE_CLEAR)
+    t.reg_write(R_TRACE_CTRL, trace_ctrl)
+    if snap:
+        t.reg_write(R_SNAP, 1)
+    t.reg_write(R_CTRL, CTRL_CLEAR)
+    t.reg_write(R_CTRL, CTRL_RUN)
+    t.poll(R_STATUS, ST_HALTED, ST_HALTED)
+    t.poll(R_TRACE_CTRL, TRACE_BUSY, 0)
+    if snap:
+        t.reg_write(R_SNAP, 1)
+    t.reg_write(R_TRACE_ADDR, 0)
+    head = [R_STATUS, R_CYCLES, R_CYCLES_HI, R_ICOUNT, R_B_RD, R_B_WR, R_TRACE_COUNT,
+            R_TRACE_DROP, R_SNAP]
+    shadows = [0x100 + 4 * k for k in range(2 * len(COUNTERS))] if snap else []
+    v = t.reg_read_many(head + shadows + [R_TRACE_LO, R_TRACE_HI] * nrec)
+    st, lo, hi, ic, brd, bwr, cnt, drop, nsnap = v[:len(head)]
+    r = {"status": st, "cycles": lo | hi << 32, "icount": ic, "b_rd": brd, "b_wr": bwr,
+         "count": cnt, "drop": drop, "snaps": nsnap, "sim": sim_lines(t.out)}
+    v = v[len(head):]
+    if snap:
+        r["counters"] = {n: v[2 * k] | v[2 * k + 1] << 32 for k, n in enumerate(COUNTERS)}
+        v = v[len(shadows):]
+    r["raw"] = [v[2 * k] | v[2 * k + 1] << 32 for k in range(nrec)]
+    t.reg_write(R_CTRL, 0)
+    return r
+
+
+# ------------------------------------------------------------------------------ registers
+def test_register_map(have_verilator):
+    t = SimTransport(ch_bytes=1 << 20, params={"TRACE_DEPTH": 1024, "PQ_WIN": 256,
+                                               "CORE_KHZ": 75294, "DDR_MTS": 1066})
+    t.reg_write(R_SCRATCH, 0x1234_5678)
+    t.reg_write(R_TRACE_CTRL, TRACE_ENABLE | TRACE_STOP_WHEN_FULL)
+    t.reg_write(R_TRACE_ADDR, 77)
+    t.reg_write(0x60 + 4 * 3, 0xCAFE_F00D)                    # ARG3
+    ident, ver, regmap, caps, khz, bid, temp, snap, mts, scr, tctl, taddr, bad, a3, a4 = \
+        t.reg_read_many([0x0, R_VERSION, R_REGMAP, R_CAPS, R_CORE_KHZ, R_BUILD_ID, R_TEMP, R_SNAP,
+                         R_DDR_MTS, R_SCRATCH, R_TRACE_CTRL, R_TRACE_ADDR, 0x0FC, 0x6C, 0x70])
+    assert ident == 0x4F545055
+    assert ver == (CFG.D << 16) | (CFG.MCOLS << 8) | CFG.LANES
+    assert regmap == 5
+    # log2 256, log2 1024; WAITW, GEN, MX, STREAM (with DSTEP), run arguments, ACT_ROWS, chash,
+    # DSTEP, PAIR, 4-bit, ddr, i2c, temp, trace
+    assert caps == (0xE7 << 24) | (8 << 16) | (10 << 8) | 0x80 | 0b1111111
+    assert R.caps(caps)["mx"]
+    assert a3 == 0xCAFE_F00D and a4 == 0                      # ARG3 kept, ARG4 reset
+    assert khz == 75294 and bid == TB_BUILD_ID and mts == 1066
+    assert temp == (1 << 31) | TB_TEMP
+    assert 44.5 < TB_TEMP * 503.975 / 4096 - 273.15 < 45.5
+    assert snap == 0 and scr == 0x1234_5678 and taddr == 77
+    assert tctl == TRACE_ENABLE | TRACE_STOP_WHEN_FULL     # CLEAR reads 0, not busy
+    assert bad == 0xDEADBEEF
+
+
+def test_cfg_registers(have_verilator):
+    """Register map 4: the CFG_* registers report the target's build of the board model's
+    configuration (opentpu/target.py), and the host builds that Config from them."""
+    from opentpu import rtlsim, target as T
+    from opentpu.host.board import Board, device_config
+    t = SimTransport(ch_bytes=1 << 20)
+    info = Board(t).info()
+    c = info["cfg"]
+    # CAPS2 bit0: the full collective unit, but BAR alone on the board's uarch (the card's
+    # build, rtlsim.BOARD_UARCH COLL_GATHER 0)
+    assert info["regmap"] == 5 and info["caps2"] == {"gather": rtlsim.gathers(1)}
+    assert t.gather == rtlsim.gathers(1)
+    assert (c["S"], c["TMEM_WORDS"], c["IMEM_WORDS"], c["ACT_BLOCKS"]) == (1, 1 << 16, 1 << 15, 128)
+    assert (c["DRAM_BYTES"], c["channels"], c["channel_bytes"]) == (1 << 32, 2, 1 << 31)
+    # the TMEM as the target builds it (the board model's: release r2, one copy, TMEM_IMPL 3)
+    assert (c["MXU_IMPL"], c["TMEM_IMPL"], c["VPU_CL"], c["ULANES"]) == \
+        (2, T.current().uarch["TMEM_IMPL"], 2, 8)
+    assert c["platform"] == T.current().platform_id
+    cfg = device_config(info)                     # CFG_HASH agrees with the registers' Config
+    assert c["hash"] == T.arch_hash(cfg)
+    # the board model's sequencer takes wait entries as the simulators' (rtlsim.UARCH SEQ_WC)
+    assert cfg == T.build_config(T.current(), MCOLS=CFG.MCOLS, LANES=CFG.LANES,
+                                 ACT_ROWS=CFG.act_rows, DSTEP=1,
+                                 SEQ_WC=int(bool(rtlsim.UARCH.get("SEQ_WC"))))
+    assert t.reg_read(R.R_CFG_WIN0) == 0xDEADBEEF    # reserved
+
+
+def test_register_map_board_defaults(have_verilator):
+    t = SimTransport(ch_bytes=1 << 20)
+    caps, khz, mts = t.reg_read_many([R_CAPS, R_CORE_KHZ, R_DDR_MTS])
+    # 1024-cycle windows, 16384 records; WAITW, GEN, MX, STREAM (with DSTEP), run arguments,
+    # ACT_ROWS, chash, DSTEP, PAIR, 4-bit, temp, trace
+    assert caps == (0xE7 << 24) | (10 << 16) | (14 << 8) | 0x80 | 0b1110111
+    assert khz == 100000 and mts == 0                     # no DDR_MTS given: CAPS bit3 clear
+
+
+def test_caps_hostcal(have_verilator):
+    """HOSTCAL (the LiteDRAM top's) sets CAPS bit27 alone; memcal then sees a host-calibrated
+    bitstream, and with both STATUS CALIB bits up (the model's controllers) has nothing to do,
+    so it never touches the CSR window."""
+    from opentpu.host import memcal
+    t = SimTransport(ch_bytes=1 << 20, params={"HOSTCAL": 1})
+    caps, st = t.reg_read_many([R_CAPS, R.R_STATUS])
+    assert caps ^ SimTransport(ch_bytes=1 << 20).reg_read(R_CAPS) == 1 << 27
+    assert caps & R.CAP_HOSTCAL and memcal.hostcal(t)
+    assert st & R.ST_CALIB0 and st & R.ST_CALIB1
+    assert memcal.ensure(t) is None
+
+
+def test_caps2_coll_bar(have_verilator):
+    """Register map 5's CAPS2 bit0 (GATHER): set with the full collective unit; clear on a
+    one-slice board built with COLL_GATHER 0 (otpu_coll_bar), which runs a BAR as before, has
+    the host refuse a program with GATHER, and on one loaded past the host moves no data and
+    raises ERROR."""
+    from opentpu.host.board import NoGather
+    # (the full unit named: the board's uarch builds the card's, BAR alone; rtlsim.BOARD_UARCH)
+    full = SimTransport(ch_bytes=1 << 20, params={"COLL_GATHER": 1})
+    assert full.gather and full.reg_read_many([R_REGMAP, R.R_CAPS2]) == [5, 1]
+    # (SEQ_WC 0: the raw load below loads no wait entries, which the board's uarch would need)
+    t = SimTransport(ch_bytes=1 << 20, params={"COLL_GATHER": 0, "SEQ_WC": 0},
+                     plusargs=["+coll_gerr_ok"])
+    assert not t.gather
+    assert t.reg_read_many([R_REGMAP, R.R_CAPS2]) == [5, 0]
+    b = Board(t, check=False)
+    assert not b.gather
+    at, src, dst, n = 0x10000, 0, 1024, 32                      # 4 rows of 8 words
+    data = np.arange(1, n + 1, dtype=np.uint32)
+    copy = [I.ld(0, src, n), I.bar(), I.st(0x2000, src, n), I.halt()]
+    gat = [I.ld(0, src, n), I.ld(0x1000, dst, n), I.bar(), I.gather(src, dst, 4, 8, 8, 8, n),
+           I.st(0x2000, dst, n), I.halt()]
+
+    def raw_load(at, w):                    # what load_program does, without the refusal
+        b.write(at, w.view(np.uint8))
+        t.reg_write(R.R_PROG_ADDR, at)
+        t.reg_write(R.R_PROG_N, len(w) // 8)
+        t.reg_write(R_CTRL, R.CTRL_LOAD)
+        t.poll(R_STATUS, R.ST_LOADING, 0)
+
+    def run(prog, load):
+        b.write(0, data.view(np.uint8))
+        b.write(0x1000, np.zeros(4 * n, np.uint8))
+        b.write(0x2000, np.full(4 * n, 0xFF, np.uint8))
+        load(at, np.asarray(I.assemble(prog), np.uint32))
+        t.reg_write(R_CTRL, CTRL_CLEAR)
+        t.reg_write(R_CTRL, CTRL_RUN)
+        t.poll(R_STATUS, ST_HALTED, ST_HALTED)
+        st, ic = t.reg_read_many([R_STATUS, R_ICOUNT])
+        return st, ic, b.read(0x2000, 4 * n).view(np.uint32)
+
+    st, ic, out = run(copy, b.load_program)                     # BAR as before
+    assert st & ST_HALTED and not st & R.ST_ERROR and ic == len(copy)
+    assert (out == data).all()
+    with pytest.raises(NoGather, match="instruction 3"):
+        b.load_program(at, np.asarray(I.assemble(gat), np.uint32))
+    st, ic, out = run(gat, raw_load)                            # GATHER: ERROR, nothing moved
+    assert st & ST_HALTED and st & R.ST_ERROR and ic == len(gat)
+    assert not out.any()
+
+
+def test_i2c_pins(have_verilator):
+    """I2C_CTRL drives lines low, I2C_IN reads them back through the synchronizers; lines held
+    low from outside (+i2c_hold) read low while released. Reset leaves every line released."""
+    t = SimTransport(ch_bytes=1 << 20, plusargs=["+i2c_hold=18"])   # SDA1 and ALERT0 held
+    first = [t.queue_read(o) for o in (R.R_I2C_CTRL, R.R_I2C_IN)]
+    got = []
+    for v in (0b0001, 0b0110, 0b1111, 0):
+        t.reg_write(R.R_I2C_CTRL, v)
+        t.wait_cycles(4)
+        got.append((t.queue_read(R.R_I2C_CTRL), t.queue_read(R.R_I2C_IN)))
+    t.flush()
+    res = t.results
+    assert [res[i] for i in first] == [0, 0b00111]
+    held = 0b11000
+    assert [(res[a], res[b]) for a, b in got] == [
+        (v, 0b11111 & ~(v | held)) for v in (0b0001, 0b0110, 0b1111, 0)]
+
+
+# ------------------------------------------------------------------------------ counters
+def test_free_running_counters(have_verilator):
+    t = SimTransport(ch_bytes=CFG.DRAM_BYTES // 2, stall=30, seed=3, params={"TRACE_DEPTH": 1024})
+    prog = demo_program()
+    r = run_traced(t, demo_image(), prog, snap=True)
+    c = r["counters"]
+    assert r["status"] & ST_HALTED and r["snaps"] == 2
+    # the shadows hold the second snapshot: totals since reset (one run, and the program load)
+    assert c["UPTIME"] >= c["RUNNING"] >= c["MXU_BUSY"] >= c["MXU_MAC"] > 0
+    assert c["RUNNING"] >= max(c["VPU_BUSY"], c["QNT_BUSY"], c["DMA_BUSY"]) > 0
+    assert c["INSTR"] == r["icount"] == len(prog)
+    assert c["DRAM_RD"] >= 2 * r["b_rd"] > 0
+
+
+def _deltas(t, prog, img):
+    """Counter deltas over one run: snapshot, run, snapshot (one simulation)."""
+    b = Board(t, check=False)
+    b.write(0, img)
+    b.load(PROG_AT, prog)
+    t.reg_write(R_SNAP, 1)
+    t.reg_write(R_CTRL, CTRL_CLEAR)
+    t.reg_write(R_CTRL, CTRL_RUN)
+    t.poll(R_STATUS, ST_HALTED, ST_HALTED)
+    # the first snapshot's shadows are read before the second snapshot, in the same simulation
+    shadows = [0x100 + 4 * k for k in range(2 * len(COUNTERS))]
+    idx = [t.queue_read(o) for o in shadows]
+    t.reg_write(R_SNAP, 1)
+    v = t.reg_read_many(shadows + [R_CYCLES, R_ICOUNT, R_B_RD, R_B_WR, R_SNAP])
+    first = [t.results[i] for i in idx]
+    c0 = {n: first[2 * k] | first[2 * k + 1] << 32 for k, n in enumerate(COUNTERS)}
+    c1 = {n: v[2 * k] | v[2 * k + 1] << 32 for k, n in enumerate(COUNTERS)}
+    cyc, ic, brd, bwr, nsnap = v[len(shadows):]
+    return {n: c1[n] - c0[n] for n in COUNTERS}, cyc, ic, brd, bwr, nsnap
+
+
+def test_counter_snapshots_bracket_a_run(have_verilator):
+    """Deltas between two snapshots around a run: RUNNING is the run's CYCLES, INSTR its ICOUNT,
+    and the DRAM beats are the port B requests' (otpu_native_dram.sv): the DMA requests each chunk
+    once, and a read or a whole-chunk write takes a beat on each channel."""
+    t = SimTransport(ch_bytes=CFG.DRAM_BYTES // 2, stall=30, seed=4, params={"TRACE_DEPTH": 1024})
+    prog = [I.ld(0, 0, 4096), I.st(0x20000, 0, 4096), I.ld(0x8000, 4096, 1024),
+            I.st(0x30000, 4096, 1024), I.halt()]
+    img = np.random.default_rng(5).integers(0, 256, 0x40000).astype(np.uint8)
+    d, cyc, ic, brd, bwr, nsnap = _deltas(t, prog, img)
+    assert nsnap == 2
+    assert d["RUNNING"] == cyc and d["UPTIME"] > cyc
+    assert d["INSTR"] == ic == len(prog)
+    assert brd == (4096 + 1024) // (CFG.D // 4) and bwr == brd  # a request per chunk
+    assert d["DRAM_RD"] == 2 * brd and d["DRAM_WR"] == 2 * bwr
+    assert d["DMA_BUSY"] > 0 and d["MXU_BUSY"] == d["MXU_MAC"] == d["VPU_BUSY"] == 0
+    # the AXI model stalls (30%), but the adapter's 16-entry request queues take every DMA
+    # request at once (DRAM_WAIT counts only requests not taken; see test_mxu_starve_counter)
+    assert 0 <= d["DRAM_WAIT"] < cyc
+    # the demo: every unit, the MXU consumes its 32 chunks
+    t = SimTransport(ch_bytes=CFG.DRAM_BYTES // 2, stall=30, seed=3, params={"TRACE_DEPTH": 1024})
+    d, cyc, ic, brd, bwr, nsnap = _deltas(t, demo_program(), demo_image())
+    assert d["UPTIME"] >= d["RUNNING"] == cyc >= d["MXU_BUSY"] >= d["MXU_MAC"] == 32
+    assert min(d["VPU_BUSY"], d["QNT_BUSY"], d["DMA_BUSY"]) > 0
+    assert d["INSTR"] == ic == len(demo_program())
+    assert d["DRAM_RD"] >= 2 * brd and d["DRAM_WR"] >= bwr
+    assert d["TMEM_DENY"] >= 0
+
+
+def test_mxu_starve_counter(have_verilator):
+    """MXU_STARVE: cycles the MXU streams a command and its chunk FIFO is empty -- exactly the
+    ms of the slice's Q records (+trace), summed. With a long read latency on the channels
+    (+axi_lat 400: the read credits run out, the data comes late) the MXU does little but wait for
+    chunks (starved, ms, or blocked on the chunks it holds, mb): its busy time is its MACs and the
+    wait, while DRAM_WAIT stays near 0 (the adapter takes nearly every request). Where the wait
+    lands depends on the MXU: the systolic array starts a row only once all of its chunks are in
+    (a row never stalls in the pipeline; docs/mxu_systolic.md), so it waits on a partial row,
+    blocked, about as long as on an empty FIFO, and MXU_STARVE sees about half of its wait (a
+    quarter with the MX kernels' MLP: 12 MMs of whole QACT ranges, longer rows, against 24). A
+    short latency (20) removes nearly all of the wait."""
+    cfg, img, prog = _kernel("mlp")
+    c, cyc, q = {}, {}, {}
+    for lat in (400, 20):
+        t = SimTransport(ch_bytes=cfg.DRAM_BYTES, stall=0, plusargs=[f"+axi_lat={lat}", "+trace"],
+                         params={"TRACE_DEPTH": 1024})
+        r = run_traced(t, img, prog, trace_ctrl=0, snap=True)
+        assert r["status"] & ST_HALTED
+        c[lat], cyc[lat] = r["counters"], r["cycles"]
+        ql = [dict(re.findall(r"(\w+)=(\d+)", line)) for line in r["sim"] if line.split()[1] == "Q"]
+        q[lat] = {k: sum(int(d[k]) for d in ql) for k in ("n", "ms", "mb")}
+        assert q[lat]["n"] == cyc[lat] and c[lat]["MXU_STARVE"] == q[lat]["ms"], (c[lat], q[lat])
+        assert c[lat]["MXU_BUSY"] >= c[lat]["MXU_MAC"] + q[lat]["ms"] + q[lat]["mb"], (c[lat], q[lat])
+    wait = {lat: q[lat]["ms"] + q[lat]["mb"] for lat in q}
+    assert wait[400] > 0.9 * (c[400]["MXU_BUSY"] - c[400]["MXU_MAC"]), (c[400], q[400])
+    # near 0 at either latency: the card's uarch (r2's TMEM input stage and registered wait release) sees a
+    # few cycles at 20 (3 of 13,398 on release-2 d8fe2c15), the default uarch none
+    assert c[400]["DRAM_WAIT"] < wait[400] // 100 and c[20]["DRAM_WAIT"] <= cyc[20] // 1000, (c[400], c[20])
+    assert min(q[400]["ms"], q[400]["mb"]) > wait[400] // 5, q[400]
+    assert wait[20] < wait[400] // 20, (q[400], q[20])
+    assert cyc[20] < 0.3 * cyc[400], cyc
+
+
+# ------------------------------------------------------------------------------ trace
+def _kernel(name):
+    cfg = sim_board_config(DRAM_BYTES=1 << 23)
+    if name == "mlp":
+        a, _ = mlp_args(np.random.default_rng(0), M=1, H=512, Fd=1024)
+        comp, imgs = compile_kernel(mlp, cfg, **a)
+    else:
+        a, _ = attn_args(np.random.default_rng(1), Hq=8, Hkv=4, d=128, T=384, cap=384, block=128)
+        comp, imgs = compile_kernel(attention_decode, cfg, **a)
+    return cfg, imgs[0], comp.programs[0]
+
+
+@pytest.mark.parametrize("name,bucket", [("mlp", None), ("attention", None), ("mlp", 64),
+                                         ("attention", 32)])
+def test_trace_matches_simulator(have_verilator, name, bucket):
+    """The records, read back through TRACE_ADDR / TRACE_LO / TRACE_HI and decoded, are exactly
+    the simulator's trace lines (D S G E U from the sequencer and units, P Q H counters)."""
+    cfg, img, prog = _kernel(name)
+    depth = 8192
+    plus = ["+trace"] + ([f"+bucket={bucket}"] if bucket else [])
+    t = SimTransport(ch_bytes=cfg.DRAM_BYTES, stall=20, seed=7, plusargs=plus,   # + program
+                     params={"TRACE_DEPTH": depth})
+    r = run_traced(t, img, prog, nrec=depth)
+    assert r["status"] & ST_HALTED
+    assert r["drop"] == 0 and 0 < r["count"] <= depth
+    hw = records_to_trace(ring_order(r["raw"], r["count"], depth)).splitlines()
+    sim = r["sim"]
+    kinds = {line.split()[1] for line in sim}
+    assert kinds == set("DSGEUHPQ") if name == "mlp" else kinds >= set("DSEUHPQ")
+    assert hw == sim
+    assert sum(line.split()[1] == "P" for line in sim) >= r["cycles"] // (bucket or 1024)
+
+
+def test_trace_long_wait_is_exact(have_verilator):
+    """A start more than 65534 cycles after its instruction became ready (S's 16-bit delay field
+    saturates): the R record that follows carries the ready cycle."""
+    n = 60000
+    prog = [I.ld(0, 0, n), I.ld(0, 61000, 64), I.st(0x40000, 61000, 64), I.halt()]
+    img = np.random.default_rng(3).integers(0, 256, 4 * n).astype(np.uint8)
+    t = SimTransport(ch_bytes=CFG.DRAM_BYTES // 2, stall=99, seed=2,
+                     plusargs=["+trace", "+bucket=1000000"], params={"TRACE_DEPTH": 1024})
+    r = run_traced(t, img, prog, nrec=64)
+    sim = r["sim"]
+    assert r["count"] <= 64
+    waits = [c - rr for c, rr in ((int(x.split("c=")[1].split()[0]), int(x.split("r=")[1]))
+                                  for x in sim if " S " in x)]
+    assert max(waits) > 0xFFFF
+    kinds = [(rec >> 60) & 0xF for rec in r["raw"][:r["count"]]]
+    assert 10 in kinds                                      # an R record
+    assert records_to_trace(ring_order(r["raw"], r["count"], 64)).splitlines() == sim
+
+
+def test_decoder_skips_cut_groups():
+    """A group cut by the ring's start (its tail only) or the buffer's end (its head only) is
+    skipped; the complete groups decode."""
+    e = (4 << 60) | (3 << 52) | 100                             # T0 E c=100 s=3
+    p = (6 << 60) | (5 << 32) | 200                             # P, n=5, then 9 V records
+    vs = [(11 << 60) | (k << 56) | k for k in range(9)]
+    q = (7 << 60) | (5 << 32) | 200
+    o = (9 << 60) | (1 << 52) | 7                               # an O record's second half
+    d = (1 << 60) | (2 << 52) | (9 << 32) | 300                 # a D without its O records
+    recs = [o] + vs[5:] + [e, p] + vs + [q] + vs[:6] + [e, d]
+    assert records_to_trace(recs) == (
+        "T0 E c=100 s=3\n"
+        "T0 P c=200 n=5 bm=0 bd=1 am=2 aq=3 mx=4 fm=5 fq=6 fv=7 fc=8\n"
+        "T0 Q c=200 n=5 bs=0 as=1 ms=2 mb=3 ff=4 ld=5\n"
+        "T0 E c=100 s=3\n")
+    assert records_to_trace([], sid=1) == ""
+
+
+def test_trace_ring_and_stop_when_full(have_verilator):
+    """A ring smaller than the trace keeps the last records (a suffix of the lines); with
+    STOP_WHEN_FULL it keeps the first DEPTH records (a prefix)."""
+    depth = 128                                   # the demo writes ~320 records: the ring wraps
+    for ctrl in (TRACE_ENABLE, TRACE_ENABLE | TRACE_STOP_WHEN_FULL):
+        t = SimTransport(ch_bytes=CFG.DRAM_BYTES // 2, stall=30, seed=3,
+                         plusargs=["+trace", "+bucket=64"], params={"TRACE_DEPTH": depth})
+        r = run_traced(t, demo_image(), demo_program(), trace_ctrl=ctrl, nrec=depth)
+        sim = r["sim"]
+        hw = records_to_trace(ring_order(r["raw"], r["count"], depth)).splitlines()
+        assert r["drop"] == 0 and len(hw) > depth // 10        # up to 10 records a line (P)
+        if ctrl & TRACE_STOP_WHEN_FULL:
+            assert r["count"] == depth
+            assert hw == sim[:len(hw)]
+        else:
+            assert r["count"] > 2 * depth                  # wrapped
+            assert hw == sim[len(sim) - len(hw):]
+
+
+def test_trace_ring_past_2_32_records(have_verilator):
+    """The ring past 2^32 records (+trace_count0: the simulation's clear starts the count 200
+    records short of it): TRACE_COUNT saturates in its high bits only, its low log2(DEPTH) bits
+    are still the next record's slot, so the host reads the ring oldest first and gets the last
+    lines of the trace (a count stuck at 2^32 - 1 put the oldest record anywhere); Board's
+    trace stats say the count saturated."""
+    from opentpu.host.board import Board
+    depth = 128
+    t = SimTransport(ch_bytes=CFG.DRAM_BYTES // 2, stall=30, seed=3,
+                     plusargs=["+trace", "+bucket=64", f"+trace_count0={(1 << 32) - 200:x}"],
+                     params={"TRACE_DEPTH": depth})
+    r = run_traced(t, demo_image(), demo_program(), nrec=depth)
+    assert r["drop"] == 0 and r["count"] >> 7 == (1 << 25) - 1        # the high bits saturated
+    hw = records_to_trace(ring_order(r["raw"], r["count"], depth)).splitlines()
+    assert len(hw) > depth // 10 and hw == r["sim"][len(r["sim"]) - len(hw):]
+    tr = Board(t, check=False)._trace_out(r["count"], 0, depth, False, np.array(r["raw"], np.uint64))
+    assert tr["saturated"] and tr["wrapped"]
+    assert records_to_trace(tr["records"]).splitlines() == hw
+
+
+def test_trace_drops_are_counted(have_verilator):
+    """A two-bundle capture queue and a P/Q window every 4 cycles overflow: the lost events are
+    counted exactly, and the rest are recorded in order."""
+    depth = 4096
+    t = SimTransport(ch_bytes=CFG.DRAM_BYTES // 2, stall=30, seed=3,
+                     plusargs=["+trace", "+bucket=4"], params={"TRACE_DEPTH": depth, "TRACE_QD": 2})
+    r = run_traced(t, demo_image(), demo_program(), nrec=depth)
+    sim = r["sim"]
+    assert 0 < r["count"] < depth
+    hw = records_to_trace(ring_order(r["raw"], r["count"], depth)).splitlines()
+    assert r["drop"] > 0 and len(sim) - len(hw) == r["drop"]
+    it = iter(sim)
+    assert all(line in it for line in hw)                 # a subsequence, in order
+    # not recording: nothing is captured, nothing is dropped
+    t = SimTransport(ch_bytes=CFG.DRAM_BYTES // 2, stall=30, seed=3,
+                     plusargs=["+bucket=4"], params={"TRACE_DEPTH": depth, "TRACE_QD": 2})
+    r = run_traced(t, demo_image(), demo_program(), trace_ctrl=0)
+    assert r["count"] == 0 and r["drop"] == 0

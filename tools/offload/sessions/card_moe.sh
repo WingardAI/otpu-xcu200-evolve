@@ -1,0 +1,205 @@
+#!/bin/bash
+# offload card session runs (production bitstream, no reload): MoE models with their experts
+# streamed from a packed pool file on the host into DRAM slots, the card routing and computing
+# every expert inside its generate loop. Each run is checked against the ISA simulator's run with
+# the bitstream's configuration (its prefill logits' sha256 and its tokens: a longer run against
+# the reference's prefix) and against HF's.
+#   8b16   LFM2.5-8B-A1B, 16 tokens (hf.json's prompt, ref16.json)
+#   8b160  LFM2.5-8B-A1B, 160 tokens (hf160.json's prompt, ref160.json): the steady state
+#   q35    Qwen3.5-35B-A3B, 16 tokens at 32 slots per layer (q35-hf.json, q35ref16.json)
+#   q35lfu, 8b160lfu: the same with the slots replaced by least decayed use (--policy lfu)
+#   q35c, q35e, q35eh: the 35B by decayed use, its slots filling the DRAM (--experts 0), with
+#     the embedding table on the card or the host (--embed-table) and the router's hints off or
+#     on (--hints; docs/offload.md 5.9 and 12)
+#   q35eht, q35ehd, q35ehs, q35ehds: q35eh with the decode's hint timeline (--hint-trace), and
+#     with a request withdrawing its layer's unnamed hints (--hint-drop) and/or 128 KiB parts
+#   q35e128a/b, q35c128a/b: q35e and q35c at 128 tokens (their first 16 against the reference)
+#   q35e128t: q35e128a with each request's window and misses (--hint-trace); q35e128k: the same
+#     with the checkpoint kept mapped and the pool read one expert after another (--keep-weights
+#     --no-willneed: before session 10; docs/offload.md 10.6); q35e128r, q35e128rw, g26r:
+#     session 10's names for the defaults since
+#   q35e128s, q35e128sl: q35e128r with its timeline and DMA calls (--hint-trace), served as now
+#     and as before docs/offload.md 10.8 (--legacy-serve); g26s, g26sl: g26r's the same
+#   q35e128hn, q35e128hn8: q35e128s with the router's hints (their programs: q35ref16h), each
+#     hint's best not in a slot sent (--hint-n 1) of its top 4 or 8, whole (1632 KiB parts),
+#     withdrawn if its request does not name it (--hint-drop; docs/offload.md 12.7)
+#   q35e128sp, g26sp: q35e128s / g26s with the decode's polls paced (--poll-idle predict:
+#     PollPacer, docs/offload.md 10.10); g26s50: g26s with a 50 us sleep between empty polls
+#   g26a, g26b: gemma-4-26B-A4B (int8 layers, fp4 experts and head, slots filling the DRAM: 18 a
+#     layer), 128 tokens after wiki.txt's first paragraph (q26-hf.json, q26ref16.json: 16 tokens)
+#   g26t16, g26lm1, g26lm2: the 26B at 16 tokens, its prompt token by token (as g26a) or layer
+#     by layer in runs of 1 or 2 rows (--layer-major; docs/offload.md 13)
+#   q35t16, q35lm1, q35lm2: the same for the 35B as q35e (the table on the host, no hints)
+#   (lm1, lm2: each layer's own slots, --per-layer-slots; g26lmp2, q35lmp2: layer-major R = 2
+#   with the slots pooled, every slot serving the running layer; q35lm1e: q35lm1 with the embed
+#   runs, --embed-runs, for a bitstream with port A's fix: docs/offload.md 13.6)
+# Before each run the other pools leave the page cache and the run's pool is read into it. A run
+# whose files are not staged in O is skipped. Selftest before and after.
+# Run: otpu-lock --wait 3600 -- tools/offload/sessions/card_moe.sh   (RUNS="8b16 8b160 q35";
+# env.sh's T, O, R, RF; PSFX=.split or "" for the pools' format; G26POOL)
+set -u
+source "$(dirname "$0")/env.sh"
+PSFX=${PSFX-.split}       # the pool files: the split format (.split.bin), or "" for the slot format
+G26POOL=${G26POOL:-../g26/pool-g26-fp4.split.bin}     # (relative to O)
+# before each run every file of 100 MB or more under these but the run's checkpoint (the files in
+# its directory, and where its links lead) and pool leaves the page cache (MGLRU keeps
+# once-mmapped checkpoints over the pool's reads: docs/offload.md 10.6); "" for none. The
+# default, all of ours (as tools/qual/chatmoe.sh's): a list of places missed the pools outside
+# it (2026-10-14: MiniCPM-V's on /data/otpu, then the 26B's in offload/g26it). A link whose target
+# is outside ~/openTPU, ~/otpu-build and /data/otpu is skipped (and logged), never opened.
+# HOG=dir:dir (after DROPOTHER): the files of 100 MB or more there mapped and touched first by
+# another process, as a user's host would have them (docs/offload.md 10.7)
+DROPOTHER=${DROPOTHER-$HOME/openTPU:$HOME/otpu-build:/data/otpu}
+echo "card_moe start $(date +%T) tree $rev mem $(mem) GB"
+timeout 1800 python -m opentpu.host.selftest 2>&1 | grep -E "\[(PASS|FAIL)\]|config" | tail -12
+timeout 300 python tools/qual/refs.py cfg $R/cfg-dev.pkl > /dev/null 2>&1; echo "cfg exit $?"
+python - $R/cfg-dev.pkl $REFCFG <<'PY'
+import dataclasses, pickle, sys
+a, b = (pickle.load(open(f, "rb")) for f in sys.argv[1:])
+d = {f.name: (getattr(a, f.name), getattr(b, f.name)) for f in dataclasses.fields(a)
+     if getattr(a, f.name) != getattr(b, f.name)}
+print("  cfg: the references' configuration" if not d else f"  cfg DIFFERS from the references' (device, ref): {d}")
+sys.exit(1 if d else 0)
+PY
+[ $? = 0 ] || { echo "STOP: the device configuration is not the references'"; exit 2; }
+Q35="Qwen3.5-35B-A3B pool-q35-fp4$PSFX.bin"
+declare -A RUN=(         # checkpoint, pool, tokens, HF's, reference, output, slots (0: fill), policy,
+                         # moe_card's other options
+  [8b16]="LFM2.5-8B-A1B pool-lfm25-8b-fp4$PSFX.bin 16 hf.json ref16 card16 0 lru"
+  [8b160]="LFM2.5-8B-A1B pool-lfm25-8b-fp4$PSFX.bin 160 hf160.json ref160 card160 0 lru"
+  [8b160lfu]="LFM2.5-8B-A1B pool-lfm25-8b-fp4$PSFX.bin 160 hf160.json ref160 card160lfu 0 lfu"
+  [q35]="$Q35 16 q35-hf.json q35ref16 q35card16 32 lru"
+  [q35lfu]="$Q35 16 q35-hf.json q35ref16 q35card16lfu 32 lfu"
+  [q35c]="$Q35 16 q35-hf.json q35ref16 q35card16c 0 lfu --embed-table card --hints off"
+  [q35e]="$Q35 16 q35-hf.json q35ref16 q35card16e 0 lfu --embed-table host --hints off"
+  [q35eh]="$Q35 16 q35-hf.json q35ref16 q35card16eh 0 lfu --embed-table host --hints on"
+  [q35eht]="$Q35 16 q35-hf.json q35ref16 q35card16eht 0 lfu --embed-table host --hints on --hint-trace $R/q35card16eht.trace.json"
+  [q35ehd]="$Q35 16 q35-hf.json q35ref16 q35card16ehd 0 lfu --embed-table host --hints on --hint-drop --hint-trace $R/q35card16ehd.trace.json"
+  [q35ehs]="$Q35 16 q35-hf.json q35ref16 q35card16ehs 0 lfu --embed-table host --hints on --hint-part 128 --hint-trace $R/q35card16ehs.trace.json"
+  [q35ehds]="$Q35 16 q35-hf.json q35ref16 q35card16ehds 0 lfu --embed-table host --hints on --hint-drop --hint-part 128 --hint-trace $R/q35card16ehds.trace.json"
+  [q35e128a]="$Q35 128 q35-hf.json q35ref16 q35card128ea 0 lfu --embed-table host --hints off"
+  [q35e128b]="$Q35 128 q35-hf.json q35ref16 q35card128eb 0 lfu --embed-table host --hints off"
+  [q35e128t]="$Q35 128 q35-hf.json q35ref16 q35card128et 0 lfu --embed-table host --hints off --hint-trace $R/q35card128et.trace.json"
+  [q35e128k]="$Q35 128 q35-hf.json q35ref16 q35card128ek 0 lfu --embed-table host --hints off --keep-weights --no-willneed --hint-trace $R/q35card128ek.trace.json"
+  [q35e128r]="$Q35 128 q35-hf.json q35ref16 q35card128er 0 lfu --embed-table host --hints off --release-weights --hint-trace $R/q35card128er.trace.json"
+  [q35e128rw]="$Q35 128 q35-hf.json q35ref16 q35card128erw 0 lfu --embed-table host --hints off --release-weights --willneed --hint-trace $R/q35card128erw.trace.json"
+  [q35e128s]="$Q35 128 q35-hf.json q35ref16 q35card128es 0 lfu --embed-table host --hints off --hint-trace $R/q35card128es.trace.json"
+  [q35e128hn]="$Q35 128 q35-hf.json q35ref16h q35card128ehn 0 lfu --embed-table host --hints on --hint-drop --hint-n 1 --hint-top 4 --hint-part 1632 --hint-trace $R/q35card128ehn.trace.json"
+  [q35e128hn8]="$Q35 128 q35-hf.json q35ref16h q35card128ehn8 0 lfu --embed-table host --hints on --hint-drop --hint-n 1 --hint-top 8 --hint-part 1632 --hint-trace $R/q35card128ehn8.trace.json"
+  [q35e128sl]="$Q35 128 q35-hf.json q35ref16 q35card128esl 0 lfu --embed-table host --hints off --legacy-serve --hint-trace $R/q35card128esl.trace.json"
+  [q35e128sp]="$Q35 128 q35-hf.json q35ref16 q35card128esp 0 lfu --embed-table host --hints off --poll-idle predict --hint-trace $R/q35card128esp.trace.json"
+  [q35c128a]="$Q35 128 q35-hf.json q35ref16 q35card128ca 0 lfu --embed-table card --hints off"
+  [q35c128b]="$Q35 128 q35-hf.json q35ref16 q35card128cb 0 lfu --embed-table card --hints off"
+  [g26a]="gemma-4-26B-A4B $G26POOL 128 q26-hf.json q26ref16 g26card128a 0 lfu --wformat int8 --formats experts=fp4 --head-format fp4"
+  [g26b]="gemma-4-26B-A4B $G26POOL 128 q26-hf.json q26ref16 g26card128b 0 lfu --wformat int8 --formats experts=fp4 --head-format fp4"
+  [g26r]="gemma-4-26B-A4B $G26POOL 128 q26-hf.json q26ref16 g26card128r 0 lfu --wformat int8 --formats experts=fp4 --head-format fp4 --release-weights"
+  [g26s]="gemma-4-26B-A4B $G26POOL 128 q26-hf.json q26ref16 g26card128s 0 lfu --wformat int8 --formats experts=fp4 --head-format fp4 --hint-trace $R/g26card128s.trace.json"
+  [g26sl]="gemma-4-26B-A4B $G26POOL 128 q26-hf.json q26ref16 g26card128sl 0 lfu --wformat int8 --formats experts=fp4 --head-format fp4 --legacy-serve --hint-trace $R/g26card128sl.trace.json"
+  [g26s50]="gemma-4-26B-A4B $G26POOL 128 q26-hf.json q26ref16 g26card128s50 0 lfu --wformat int8 --formats experts=fp4 --head-format fp4 --poll-idle 50e-6 --hint-trace $R/g26card128s50.trace.json"
+  [g26sp]="gemma-4-26B-A4B $G26POOL 128 q26-hf.json q26ref16 g26card128sp 0 lfu --wformat int8 --formats experts=fp4 --head-format fp4 --poll-idle predict --hint-trace $R/g26card128sp.trace.json"
+  [g26t16]="gemma-4-26B-A4B $G26POOL 16 q26-hf.json q26ref16 g26card16 0 lfu --wformat int8 --formats experts=fp4 --head-format fp4"
+  [g26lm1]="gemma-4-26B-A4B $G26POOL 16 q26-hf.json q26ref16 g26card16lm1 0 lfu --wformat int8 --formats experts=fp4 --head-format fp4 --layer-major 1 --per-layer-slots"
+  [g26lm2]="gemma-4-26B-A4B $G26POOL 16 q26-hf.json q26ref16 g26card16lm2 0 lfu --wformat int8 --formats experts=fp4 --head-format fp4 --layer-major 2 --per-layer-slots"
+  [g26lmp2]="gemma-4-26B-A4B $G26POOL 16 q26-hf.json q26ref16 g26card16lmp2 0 lfu --wformat int8 --formats experts=fp4 --head-format fp4 --layer-major 2"
+  [q35t16]="$Q35 16 q35-hf.json q35ref16 q35card16t 0 lfu --embed-table host --hints off"
+  [q35lm1]="$Q35 16 q35-hf.json q35ref16 q35card16lm1 0 lfu --embed-table host --hints off --layer-major 1 --per-layer-slots"
+  [q35lm2]="$Q35 16 q35-hf.json q35ref16 q35card16lm2 0 lfu --embed-table host --hints off --layer-major 2 --per-layer-slots"
+  [q35lmp2]="$Q35 16 q35-hf.json q35ref16 q35card16lmp2 0 lfu --embed-table host --hints off --layer-major 2"
+  [q35lm1e]="$Q35 16 q35-hf.json q35ref16 q35card16lm1e 0 lfu --embed-table host --hints off --layer-major 1 --per-layer-slots --embed-runs")
+for name in ${RUNS:-8b16 8b160 q35}; do
+  read -r md pool n hf ref out ex pol extra <<< "${RUN[$name]}"
+  if [ ! -f $O/$md/config.json ] || [ ! -f $O/$pool ] || [ ! -f $RF/$ref.json ]; then
+    echo "  [SKIP] $name: not staged"; continue; fi
+  echo "=== $name $(date +%T)"
+  python - $O/$pool $O/pool-*.bin $O/$(dirname $G26POOL)/pool-*.bin <<'PY'
+import os, sys                                # the other pools out of the page cache (session 8:
+for f in set(map(os.path.realpath, sys.argv[2:])) - {os.path.realpath(sys.argv[1])}:   # the
+    if os.path.exists(f):                     # 26B's pages, read twice, outlived the 35B's, read
+        fd = os.open(f, os.O_RDONLY)          # once, and its staging read the disk)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        os.close(fd)
+PY
+  if [ -n "${DROPOTHER:-}" ]; then            # every other checkpoint's pages out too (session
+    python - $O/$md $O/$pool $DROPOTHER <<'PY'  # 10: MGLRU kept the mmapped checkpoints of the
+import os, sys                                # session before, 13.6 GB, over the pool's reads)
+keep = {os.path.realpath(sys.argv[1]), os.path.realpath(sys.argv[2])}
+keep |= {os.path.realpath(os.path.join(sys.argv[1], f)) for f in os.listdir(sys.argv[1])}  # (links)
+ours = tuple(os.path.realpath(os.path.expanduser(d)) + os.sep
+             for d in ("~/openTPU", "~/otpu-build", "/data/otpu"))
+gb = n = 0
+seen = set()
+for d in sys.argv[3].split(":"):
+    for root, _, files in os.walk(os.path.expanduser(d)):     # (links to files followed,
+        for f in files:                                      # to directories not)
+            r = os.path.realpath(os.path.join(root, f))
+            if not r.startswith(ours):                       # a link out of our trees: the
+                if r not in seen:                            # host's other files are not
+                    print(f"  DROPOTHER skipped {os.path.join(root, f)} -> {r}")   # ours
+                seen.add(r)
+                continue
+            if (r in seen or not os.path.isfile(r) or os.path.getsize(r) < 100 << 20
+                    or r in keep or os.path.dirname(r) in keep):
+                continue
+            seen.add(r)
+            fd = os.open(r, os.O_RDONLY)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            os.close(fd)
+            gb, n = gb + os.path.getsize(r) / 1e9, n + 1
+print(f"  dropped from the page cache: {n} other files of {gb:.1f} GB")
+PY
+  fi
+  if [ -n "${HOG:-}" ]; then                  # a user's host: files another process mapped
+    python - $HOG <<'PY'                        # and touched (and exited), which a session
+import mmap, os, sys                          # cannot evict (docs/offload.md 10.7)
+import numpy as np
+ours = tuple(os.path.realpath(os.path.expanduser(d)) + os.sep for d in ("~/openTPU", "~/otpu-build"))
+gb = 0
+for d in sys.argv[1].split(":"):
+    for root, _, files in os.walk(os.path.expanduser(d)):
+        for f in files:
+            r = os.path.realpath(os.path.join(root, f))
+            if not r.startswith(ours) or os.path.getsize(r) < 100 << 20:
+                continue
+            fd = os.open(r, os.O_RDONLY)
+            mm = mmap.mmap(fd, os.path.getsize(r), prot=mmap.PROT_READ)
+            int(np.frombuffer(mm, np.uint8)[::mmap.PAGESIZE].sum())
+            mm.close()
+            os.close(fd)
+            gb += os.path.getsize(r) / 1e9
+print(f"  hog: {gb:.1f} GB mapped and touched")
+PY
+  fi
+  t0=$SECONDS; cat $O/$pool > /dev/null      # the RAM tier warm before each timed run, and how
+  python - $O/$pool <<'PY'                    # much of the pool the page cache holds
+import os, sys
+from opentpu.host.offload import PoolFile
+p = sys.argv[1]
+n = os.path.getsize(p + ".packed")
+print(f"  pool warm: {PoolFile(p, os.path.getsize(p) // n, True).resident(range(n)) / 1e9:.2f} of "
+      f"{os.path.getsize(p) / 1e9:.2f} GB resident")
+PY
+  echo "  (read in $((SECONDS - t0)) s)"
+  timeout 3600 python tools/offload/moe_card.py $O/$md --check $O/$hf -n $n --pool $O/$pool \
+    --cfg $R/cfg-dev.pkl --experts $ex --card --policy $pol ${extra:-} --out $R/$out.json \
+    > $R/$out.log 2>&1
+  echo "  exit $? $(date +%T)"; grep -E "Error|Traceback" $R/$out.log | tail -3
+  [ -f $R/$out.json ] || continue
+  python - $R/$out.json $RF/$ref.json $O/$hf <<'PY'
+import json, sys
+c, r, h = (json.load(open(f)) for f in sys.argv[1:])
+same = c["tokens"][:len(r["tokens"])] == r["tokens"]      # (a longer run: the reference's prefix)
+dh = next((i for i, (a, b) in enumerate(zip(c["tokens"], h["tokens"])) if a != b), None)
+print(f"  [{'PASS' if same and c['prefill_logits_sha'] == r['prefill_logits_sha'] else 'FAIL'}] "
+      f"vs ISA sim: tokens {'same' if same else 'DIFFER'}, prefill sha {c['prefill_logits_sha']} "
+      f"vs {r['prefill_logits_sha']}; vs HF: first diff {dh}")
+k = ("tok_s_wall", "tok_s_device", "hits", "misses", "misses_per_token_decode",
+     "misses_per_token_decode_2nd_half", "bytes_per_token_decode", "host_decode_s", "load_s",
+     "prefill_s", "generate_s", "experts_per_layer", "policy", "pool_warm", "embed_host",
+     "hints", "layer_major", "pooled", "embed_runs", "prefill_requests", "prefill_misses",
+     "host_mem", "device_counters")
+print("  " + json.dumps({x: c.get(x) for x in k}))
+PY
+done
+echo "=== final selftest $(date +%T)"
+timeout 1800 python -m opentpu.host.selftest 2>&1 | grep -E "\[(PASS|FAIL)\]|config|ALL" | tail -12
+echo "CARD_MOE DONE $(date +%T)"

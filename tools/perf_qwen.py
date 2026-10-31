@@ -1,0 +1,539 @@
+"""Profile one decode token on the RTL at the board configuration (the board's memory path:
+otpu_native_dram in front of the native memory model, sim/verilator/otpu_native_mem.sv).
+
+    python3 tools/perf_qwen.py [--model qwen3|lfm2|qwen35|gemma4|DIR] [--layers N] [--pos P]
+                               [--bw 100] [--check] [--wformat int8|int4|fp4]
+                               [--head-format int8|int4|fp4] [--ddr 1066 [--mhz 100] [--ldc]]
+
+Uses the real weights (models/Qwen3-0.6B, or --model lfm2: models/LFM2.5-230M, --model qwen35:
+models/Qwen3.5-0.8B, --model gemma4: models/gemma-4-E2B-it), optionally only the first N layers
+(Gemma 4: or a list of checkpoint layers, e.g. 0,1,2,3,4,15,19, its KV-shared layers attending
+to the last own layer of their kind in the list; the LM head is always complete).
+Prints cycles, the core-port roofline (port-B chunk transfers: weights, KV, LD/ST chunks; port
+A; the MXU's own rate), the useful-bytes roofline, the DRAM efficiency, tokens/s at --mhz, the
+cycles per phase of the token (DeltaNet, attention, MLP, LM head) with their bytes, MM time per
+kernel source line, and the MXU idle gaps with their causes.
+
+--ddr MTS: the DDR3 bank model calibrated on the card (opentpu.profile.ddr3_plusargs; ROW_BANK_
+COLUMN, 300 ns latency) at DDR3-MTS with the core at --mhz (the controller clock, LiteDRAM's sys,
+is MTS / 8). --ldc: the card's channels instead of the bank model -- the board's bridge and
+LiteDRAM's own controller with the production core's settings (DDR3-1066 only, the board's
+rate; rtlsim.MEMORY's LDC). DRAM efficiency = the token's DRAM bytes (weights, scales, KV,
+I/O, reads and writes) / (its time x the DDR3 peak, 16 bytes x MTS: 17.07 GB/s at 1066).
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import re
+import sys
+import time
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from opentpu import isa as I  # noqa: E402
+from opentpu import rtlsim  # noqa: E402
+from opentpu.isasim import Machine, board_config  # noqa: E402
+from opentpu.llm import MODELS, load_spec, model_dir  # noqa: E402
+from opentpu.llm.qwen3 import load_weights, rope_tables  # noqa: E402
+from opentpu.profile import ddr3_peak, ddr3_plusargs, dram_efficiency, parse  # noqa: E402
+
+
+# kernel functions that name a phase of the token (the innermost one on an instruction's source
+# stack wins)
+PHASE_NAMES = {"head_step": "DeltaNet", "_deltanet": "DeltaNet", "_pair_segment": "DeltaNet",
+               "_deltanet_dstep": "DeltaNet", "_deltanet_rows": "DeltaNet",
+               "_attention": "attention", "_attend_heads": "attention", "_conv": "conv",
+               "_mlp": "MLP", "swiglu_down": "MLP", "_lm_head": "LM head",
+               "_attention_rows": "attention", "qwen3_rows": "LM head",
+               "_ple": "PLE", "_ple_inputs": "PLE", "_gathered": "gather",
+               "qwen35_mtp": "MTP"}
+
+
+def _phase(ins):
+    for _, _, fn in ins.src:
+        if fn in PHASE_NAMES:
+            return PHASE_NAMES[fn]
+    return "other"
+
+
+def _src(ins, depth=1):
+    s = ins.src[depth] if len(ins.src) > depth else (ins.src[0] if ins.src else ("?", 0, "?"))
+    return f"{Path(s[0]).name}:{s[1]} {s[2]}"
+
+
+def _gap_table(p, progs, pbytes, bpc):
+    """Per phase: cycles, roofline (useful bytes at bpc bytes per cycle) and the excess, and the
+    phase's cycles split by the MXU's state (MAC / starved: chunk FIFO empty / blocked: chunks
+    but no MAC (scales or the drain) / no MM streaming) and port B's idle cycles. A 64-cycle
+    counter window goes to the phase whose run (as Profile.phases charges them) holds its end."""
+    runs, done = [], 0
+    for r in sorted(p.slice_recs(0), key=lambda r: r.idx):
+        if r.end > done:
+            ph = _phase(progs[0][r.pc])
+            if runs and runs[-1][2] == ph:
+                runs[-1][1] = r.end
+            else:
+                runs.append([done, r.end, ph])
+            done = r.end
+    b = p.buckets[0]
+    acc = defaultdict(lambda: defaultdict(int))
+    k = 0
+    for i, c in enumerate(b["c"]):
+        while k + 1 < len(runs) and runs[k][1] < c:
+            k += 1
+        t = acc[runs[k][2] if runs else "other"]
+        n = b["n"][i]
+        t["n"] += n
+        t["mac"] += b["mx"][i]
+        t["starve"] += b["ms"][i]
+        t["block"] += b["mb"][i]
+        t["bidle"] += n - b["bm"][i] - b["bd"][i]
+    cyc = p.phases(lambda r: _phase(progs[0][r.pc]))
+    print("gap table: cycles, roofline, excess; MXU MAC / starved / blocked / no MM; "
+          "port B idle")
+    rows = []
+    for ph, v in cyc.items():
+        rl = pbytes[ph] / bpc
+        t = acc[ph]
+        idle = t["n"] - t["mac"] - t["starve"] - t["block"]
+        rows.append((v["cycles"] - rl, ph, v["cycles"], rl, t, idle))
+    for ex, ph, cy, rl, t, idle in sorted(rows, key=lambda x: -x[0]):
+        print(f"  {ph:12s} {cy:9d} {rl:9.0f} {ex:+9.0f}   MAC {t['mac']:8d}  starved "
+              f"{t['starve']:7d}  blocked {t['block']:7d}  no MM {idle:7d}   B idle {t['bidle']:8d}")
+    # the MXU's starved / blocked windows by MM source line (the MM consuming at the window's end)
+    mms = sorted((r for r in p.slice_recs(0) if r.op == I.MM and r.end >= 0),
+                 key=lambda r: max(r.start, r.release))
+    by = defaultdict(lambda: [0, 0, 0])
+    k = 0
+    for i, c in enumerate(b["c"]):
+        while k + 1 < len(mms) and max(mms[k + 1].start, mms[k + 1].release) <= c:
+            k += 1
+        if mms and max(mms[k].start, mms[k].release) <= c <= mms[k].end + b["n"][i]:
+            t = by[_src(progs[0][mms[k].pc], 0)]
+            t[0] += b["ms"][i]
+            t[1] += b["mb"][i]
+            t[2] += b["mx"][i]
+    print("  MXU starved / blocked / MAC by MM source (top 8 by starved + blocked)")
+    for src, (ms, mb, mx) in sorted(by.items(), key=lambda x: -(x[1][0] + x[1][1]))[:8]:
+        print(f"    {src:50s} starved {ms:7d}  blocked {mb:7d}  MAC {mx:8d}")
+
+
+def _union(iv) -> int:
+    tot, cs, ce = 0, None, None
+    for x, y in sorted(iv):
+        if ce is None or x > ce:
+            tot += 0 if ce is None else ce - cs
+            cs, ce = x, y
+        else:
+            ce = max(ce, y)
+    return tot + (0 if ce is None else ce - cs)
+
+
+def _json_line(a, p, progs, cfg, R, hacked, pbytes, D):
+    """One JSON line of the run (--json): cycles, units' busy, the stream engine's busy (its
+    DSTEP / STREAM intervals: the profile counts them on the DMA), per VOP function the
+    instructions and busy cycles, per phase cycles / VPU / MXU / SE, and the MXU gaps' blame
+    by the class of the instruction they waited on."""
+    import json
+    recs = p.slice_recs(0)
+    from opentpu import isa as II
+    se = _union([(r.start, r.end) for r in recs if r.op in (II.DSTEP, II.STREAM) and r.start >= 0])
+    sys.path.insert(0, str(ROOT / "tools"))
+    import vpu_hack
+    vf = defaultdict(lambda: [0, 0, 0])     # per function: count, busy, issue cycles (model)
+    for r in recs:
+        ins = progs[0][r.pc]
+        if r.op in (II.VOP, II.DSTEP, II.STREAM) and r.start >= 0:
+            f = II.VFUNCS.get((ins.w[5] >> 16) & 0xFF, "?") if r.op == II.VOP else r.name
+            vf[f][0] += 1
+            vf[f][1] += r.end - r.start
+            vf[f][2] += vpu_hack.issue_cycles(ins, cfg.LANES)
+    ph = p.phases(lambda r: _phase(progs[0][r.pc]))
+    for k, v in ph.items():
+        v["SE"] = _union([(r.start, r.end) for r in recs if r.op in (II.DSTEP, II.STREAM)
+                          and r.start >= 0 and _phase(progs[0][r.pc]) == k])
+        v["bytes"] = pbytes.get(k, 0)
+    g = p.mxu_gaps(0)
+    blame = defaultdict(int)
+    for (name, _), v in g["blame"].items():
+        blame[name] += v
+    out = {"model": Path(str(a.model)).name, "wformat": a.wformat, "head": a.head_format,
+           "rows": a.rows, "batch": a.batch, "pos": a.pos, "layers": a.layers,
+           "mcols": cfg.MCOLS, "hack": a.hack, "hacked": hacked, "cycles": p.cycles,
+           "instructions": len(progs[0]), "busy": p.unit_busy(0), "se_busy": se,
+           "vop": {k: v for k, v in sorted(vf.items())}, "phases": ph,
+           "mxu_gaps": {"prologue": g["prologue"], "epilogue": g["epilogue"],
+                        "gaps": sum(y - x for x, y, _ in g["gaps"]), "blame": dict(blame)},
+           "roofline": p.roofline()["bound"]}
+    with open(a.json, "a") as f:
+        f.write(json.dumps(out) + "\n")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="qwen3",
+                    help=f"{' or '.join(MODELS)} (models/<name>), or a checkpoint directory")
+    ap.add_argument("--layers", default="2", help="0: all; Gemma 4: or a comma list of "
+                    "checkpoint layers")
+    ap.add_argument("--pos", type=int, default=9)
+    ap.add_argument("--cap", type=int, default=None,
+                    help="KV cache capacity (tokens); default: the multiple of 256 above pos")
+    ap.add_argument("--bw", type=int, default=100)
+    ap.add_argument("--lat", type=int, default=None, help="read latency, core cycles "
+                    "(default 30; with --ddr 300 ns)")
+    ap.add_argument("--stall", type=int, default=0)
+    ap.add_argument("--dram", choices=["off", "brc", "rbc"], default="off",
+                    help="DDR3 bank / row timing (otpu_native_mem.sv) with the address map "
+                         "BANK_ROW_COLUMN or ROW_BANK_COLUMN (LiteDRAM's; replaces --bw)")
+    ap.add_argument("--ddr", type=float, default=None,
+                    help="DDR3 MT/s of the calibrated bank model (800, 1066, 1300; sets "
+                         "--dram rbc and the timings)")
+    ap.add_argument("--mhz", type=float, default=100.0, help="core clock (tokens/s; --ddr)")
+    ap.add_argument("--ldc", action="store_true",
+                    help="--ddr: LiteDRAM's controller co-simulated instead of the bank model")
+    ap.add_argument("--plus", action="append", default=[],
+                    help="extra simulator argument, e.g. --plus +axi_trfc=26 (repeatable)")
+    ap.add_argument("--rows", type=int, default=0,
+                    help="R token rows at positions pos .. pos+R-1 of one sequence in one program "
+                         "(qwen3_rows: a prefill chunk or a speculative verify pass); 0: the "
+                         "decode step")
+    ap.add_argument("--logits", choices=["last", "all", "none"], default="last",
+                    help="--rows: which rows get logits (prefill: last or none; verify: all)")
+    ap.add_argument("--mcols", type=int, default=None, help="MXU columns (default OTPU_MCOLS or 4)")
+    ap.add_argument("--block", type=int, default=None, help="attention block (tokens)")
+    ap.add_argument("--depth", type=int, default=None, help="attention score blocks in flight")
+    ap.add_argument("--check", action="store_true", help="compare with the ISA simulator")
+    ap.add_argument("--dump", help="write the run's Lens profile data (lens.to_data) as JSON")
+    ap.add_argument("--resident", action="store_true",
+                    help="the resident decode program of pos's bucket (run arguments, inputs "
+                         "from the image's tables; qwen3.compile_decode); with --rows the "
+                         "resident engine's prefill run, its inputs from the tables too "
+                         "(compile_rows tokens)")
+    ap.add_argument("--generate", type=int, default=0, metavar="N",
+                    help="with --resident: the decode loop on the device (generate.py), N "
+                         "tokens from pos in one run (greedy, or --sample); cycles per token")
+    ap.add_argument("--sample", default=None, metavar="T,K,P,PEN",
+                    help="--generate sampled: temperature, top-k, top-p, repetition penalty")
+    ap.add_argument("--mtp", choices=["verify", "draft"], default=None,
+                    help="Qwen3.5 MTP decoding (opentpu/llm/mtp.py, docs/mtp.md 9): the k = 1 "
+                         "verify run (2 rows, logits of both, the hidden rows stored, the "
+                         "DeltaNet steps of row 1 into the other state slot) or the MTP "
+                         "drafter's run over 2 rows")
+    ap.add_argument("--timeline", help="print the instructions of dynamic index range A:B")
+    ap.add_argument("--idle", action="store_true", help="list DRAM-idle stretches (64-cycle windows)")
+    ap.add_argument("--wformat", default="int8", choices=["int8", "int4", "fp4", "mix"],
+                    help="weight format of the layers (opentpu/quant.py)")
+    ap.add_argument("--head-format", default=None, choices=["int8", "int4", "fp4"],
+                    help="weight format of the LM head (default: --wformat)")
+    ap.add_argument("--batch", type=int, default=0, metavar="B",
+                    help="a batched decode step: B sequences (KV slots) at --pos each, one row a "
+                         "slot, every row's logits (Qwen3 family: opentpu/llm/batch.py's step, "
+                         "the pick on the device; other models: compile_rows over the slots)")
+    ap.add_argument("--hack", default="",
+                    help="timing-only program transforms, comma list (tools/vpu_hack.py: novop, "
+                         "nocomp, comp1, half, halfcomp, halfew, nose, halfse); results wrong")
+    ap.add_argument("--json", help="append the run's numbers as one JSON line to this file")
+    ap.add_argument("--gaps", action="store_true",
+                    help="per phase: the cycles above its roofline, split by what the MXU and "
+                         "port B did (64-cycle windows)")
+    a = ap.parse_args()
+    plus = list(a.plus)
+    ldc = 0
+    if a.ldc:
+        if not a.ddr or int(a.ddr) not in rtlsim.LDC_MODELS:
+            ap.error(f"--ldc needs --ddr {' / '.join(map(str, rtlsim.LDC_MODELS))}")
+        ldc = int(a.ddr)
+        plus = plus + rtlsim.ldc_plusargs(ldc, a.mhz)
+    if a.ddr:
+        a.ddr = {1066: 3200 / 3, 1333: 4000 / 3}.get(int(a.ddr), a.ddr)
+        plus = plus + ddr3_plusargs(a.ddr, a.mhz)[2:]   # the first of a plusarg wins
+        a.dram = "rbc" if a.dram == "off" else a.dram
+        a.lat = a.lat if a.lat is not None else round(0.3 * a.mhz)
+    a.lat = 30 if a.lat is None else a.lat
+    path = model_dir(a.model)
+    spec = load_spec(path)
+    layers = [int(x) for x in a.layers.split(",")]
+    if hasattr(spec, "truncated") and layers != [0]:
+        spec = spec.truncated(layers if len(layers) > 1 else range(layers[0]))
+    elif len(layers) > 1:
+        ap.error("--layers: a list of layers needs a Gemma 4 checkpoint")
+    elif layers[0]:
+        spec = dataclasses.replace(spec, **({"kinds": spec.kinds[:layers[0]]}
+                                            if hasattr(spec, "kinds") else {"layers": layers[0]}))
+    if a.mtp:
+        spec = dataclasses.replace(spec, mtp=True)
+        a.rows, a.logits = 2, "all"
+    R = max(1, a.rows, a.batch)
+    if a.batch and (a.rows or a.mtp or a.resident):
+        ap.error("--batch is a decode step of its own (no --rows, --mtp, --resident)")
+    if a.cap is None:
+        a.cap = 256 * ((a.pos + R - 1) // 256 + 1)
+    if a.pos + (1 if a.batch else R) - 1 >= a.cap:
+        ap.error(f"--pos {a.pos} needs --cap above it (the KV write would land past the cache)")
+    W = load_weights(path, mtp=bool(a.mtp))
+    wkw = dict(wformat=a.wformat, head_format=a.head_format, rows=R,
+               **({"lookup": True} if a.resident else {}))
+    qwen3_batch = bool(a.batch) and type(spec).__module__.endswith(".qwen3")
+    if a.batch:
+        wkw.update(batch=a.batch, **({"lookup": True} if qwen3_batch else {}))
+    mk = {"MCOLS": a.mcols} if a.mcols else {}
+    need = spec.image(board_config(DRAM_BYTES=1 << 40, **mk), a.cap, **wkw).nbytes
+    need += (64 << 20) if qwen3_batch else 0           # the batch area (batch.alloc)
+    cfg = board_config(DRAM_BYTES=1 << max(20, (need - 1).bit_length()), **mk)
+    img = spec.image(cfg, a.cap, **wkw)
+    dram = img.build(W)[0]
+    # the rows' (slot, position): a batched step's slots at pos, or one sequence's positions
+    rows = [(s, a.pos) for s in range(a.batch)] if a.batch else [(0, a.pos + r) for r in range(R)]
+    # the rows' inputs (the KV cache before pos stays zero: timing does not depend on it)
+    if hasattr(img, "host_inputs"):         # Gemma 4: the gathered rows, the RoPE rows
+        parts = img.host_inputs([791 + r for r in range(R)], [p for _, p in rows])
+    else:
+        emb = np.stack([np.asarray(W["model.embed_tokens.weight"][791 + r], np.float32)
+                        for r in range(R)])
+        tabs = [rope_tables(spec, p) for _, p in rows]
+        c, s = np.stack([t[0] for t in tabs]), np.stack([t[1] for t in tabs])
+        parts = [(img.io[k], v) for k, v in (("x", emb), ("cos", c), ("sin", s))]
+    for addr, v in parts:
+        b = np.ascontiguousarray(v, np.float32).view(np.uint8).ravel()
+        dram[addr:addr + b.size] = b
+    # rows of tables the host keeps (Gemma 4 E4B's PLE records), as the Engine writes them
+    for addr, v in getattr(img, "host_rows", lambda t: [])([791 + r for r in range(R)]):
+        b = np.ascontiguousarray(v).view(np.uint8).ravel()
+        dram[addr:addr + b.size] = b
+    if a.depth:
+        import opentpu.llm.qwen3 as Q
+        Q.ATTN_DEPTH = a.depth
+    args = None
+    if qwen3_batch:
+        from opentpu.llm import batch as BA
+        from opentpu.llm.qwen3 import ATTN_BLOCK
+        area = BA.alloc(img, cfg, a.batch, -(-img.nbytes // 4096) * 4096)
+        if area["end"] > cfg.DRAM_BYTES:
+            ap.error("--batch: no room for the batch area")
+        dram = np.concatenate([dram, np.zeros(max(0, area["end"] - len(dram)), np.uint8)])
+        BA.build([dram], area, spec, cfg)
+        tin = np.asarray([791 + s for s in range(a.batch)], np.float32).view(np.uint8)
+        dram[area["tin"]:area["tin"] + tin.size] = tin
+        progs = BA.compile_step(img, area, rows, [None] * a.batch, a.block or ATTN_BLOCK)
+    elif a.batch:
+        progs = img.compile_rows(rows, list(range(R)), *([a.block] if a.block else []))
+    elif a.mtp == "draft":
+        progs = img.compile_mtp(a.pos, R, None, *([a.block] if a.block else []))
+    elif a.mtp == "verify":
+        progs = img.compile_rows([(0, a.pos + r) for r in range(R)], list(range(R)),
+                                 *([a.block] if a.block else []), fork=True, hidden=True)
+    elif a.rows:
+        lr = {"last": [R - 1], "all": list(range(R)), "none": []}[a.logits]
+        progs = img.compile_rows([(0, a.pos + r) for r in range(R)], lr,
+                                 *([a.block] if a.block else []),
+                                 **({"tokens": [791 + r for r in range(R)]} if a.resident
+                                    else {}))
+    elif a.resident and a.generate:
+        from opentpu.llm import generate as G
+        from opentpu.llm.qwen3 import ATTN_BLOCK
+        blk, K = a.block or ATTN_BLOCK, getattr(spec, "conv_k", 1)
+        b = a.pos // blk + 1
+        if a.pos + a.generate > b * blk:
+            ap.error(f"--generate {a.generate} from --pos {a.pos} leaves the bucket")
+        samp = None
+        if a.sample:
+            tt, kk, pp, pen = a.sample.split(",")
+            samp = G.Sampling(float(tt), int(kk), float(pp), float(pen))
+        progs = img.compile_generate(b, max((b - 1) * blk, K - 1), blk, chain=False, samp=samp)
+        g = img.lookup["gen"]
+        put = [(g["state"], G.state_words(spec, 791, a.pos, a.generate, [], blk, samp)),
+               (g["out"] + 4 * (a.pos + 1), np.full(a.generate, G.OUT_MARK, np.uint32))]
+        if samp is not None:
+            u = np.random.default_rng(0).random(a.generate).astype(np.float32)
+            put.append((g["uni"] + 4 * (a.pos + 1), np.minimum(u, np.float32(1 - 2.0 ** -24))))
+            if samp.pen:
+                pa, pb = np.ones(G._vpad(spec), np.float32), np.ones(G._vpad(spec), np.float32)
+                pa[[791, 1000, 2000]] = np.float32(1.0) / np.float32(samp.penalty)
+                pb[[791, 1000, 2000]] = samp.penalty            # a context of three ids
+                put += [(g["pa"], pa), (g["pb"], pb)]
+        for at, v in put:
+            v = np.ascontiguousarray(v).view(np.uint8).ravel()
+            dram[at:at + v.size] = v
+    elif a.resident:
+        from opentpu.compiler import arg_words
+        from opentpu.llm.qwen3 import ATTN_BLOCK, RunPos
+        blk, K = a.block or ATTN_BLOCK, getattr(spec, "conv_k", 1)
+        b = a.pos // blk + 1
+        progs, ra = img.compile_decode(b, max((b - 1) * blk, K - 1), blk)
+        args = arg_words(ra, RunPos.values(791, a.pos, K, blk))
+    else:
+        progs = img.compile_step(a.pos, *([a.block] if a.block else []))
+    hacked = {}
+    if a.hack:
+        sys.path.insert(0, str(ROOT / "tools"))
+        import vpu_hack
+        res = [vpu_hack.apply(p, a.hack) for p in progs]
+        progs, hacked = [p for p, _ in res], res[0][1]
+        print(f"hack {a.hack}: {hacked}")
+    if 8 * len(progs[0]) > cfg.IMEM_WORDS:      # a proxy of a longer program: time it
+        cfg = dataclasses.replace(cfg, IMEM_WORDS=1 << (8 * len(progs[0]) - 1).bit_length())
+        print(f"(IMEM grown to {cfg.IMEM_WORDS} words for {len(progs[0])} instructions)")
+    t = time.time()
+    drams, _, st = rtlsim.run(cfg, progs, [dram], trace=True,
+                              uarch=rtlsim.BOARD_UARCH,
+                              axi=True, boot=True, stall=a.stall, bw=a.bw, lat=a.lat,
+                              max_cycles=1 << 40, args=args, ldc=ldc,
+                              plusargs=([] if a.dram == "off" else
+                                        ["+axi_dram=1", f"+axi_map={int(a.dram == 'rbc')}"])
+                              + plus)
+    wall = time.time() - t
+    if a.resident and a.generate:
+        w = drams[0][g["out"] + 4 * (a.pos + 1):g["out"] + 4 * (a.pos + 1 + a.generate)]
+        got = [int(x) for x in w.view(np.float32)]
+        print(f"generate {a.generate} tokens ({'sampled ' + a.sample if samp else 'greedy'}): "
+              f"{st['cycles']} cycles, {st['cycles'] / a.generate:.0f} per token, "
+              f"{len(progs[0])} instructions; tokens {got}")
+    p = parse(st["trace"], cfg, progs, path.name)
+    p.cycles = st["cycles"]
+    rl = p.roofline()
+    # port B (chunks) runs at bw; port A (one scale word per block, from buffered beats) and the
+    # MXU (one block per cycle) do not: 4-bit weights stream two blocks per chunk
+    ps = rl["per_slice"][0]
+    ideal = max(ps["portb"] * 100 / a.bw, ps["porta_cycles"], ps["mxu"])
+    if a.rows:
+        print(f"rows={R} (positions {a.pos}..{a.pos + R - 1}, logits {a.logits}) "
+              f"MCOLS={cfg.MCOLS}: {p.cycles / R:.0f} cycles per row")
+    print(f"layers={spec.layers} pos={a.pos} bw={a.bw}% lat={a.lat}: {p.cycles} cycles "
+          f"({wall:.0f}s sim), core-port roofline {ideal:.0f} cycles (port B {ps['portb']} "
+          f"chunks, port A {ps['porta_cycles']}, MXU {ps['mxu']}), "
+          f"efficiency {100 * ideal / p.cycles:.1f}%")
+    ar = st.get("axi_reads", [])
+    if ar:
+        print("DRAM read / write beats per channel: " +
+              ", ".join(f"{r} / {w}" for (r, _), (w, _) in zip(ar, st["axi_writes"])) +
+              f"; dram={a.dram}")
+    b = p.buckets[0]
+    if b.get("ms") is not None:
+        mxb = sum(b.get("mx", []))
+        print(f"MXU starved (chunk FIFO empty while streaming, the card's MXU_STARVE) "
+              f"{sum(b['ms'])} cycles = {100 * sum(b['ms']) / p.cycles:.1f}%; blocked (chunks "
+              f"but no MAC) {100 * sum(b.get('mb', [])) / p.cycles:.1f}%; MAC "
+              f"{100 * mxb / p.cycles:.1f}%; DRAM read beats/cycle/channel "
+              f"{sum(n for _, n in ar) / 2 / p.cycles:.3f}")
+    for c, d in enumerate(st.get("axi_detail", [])):
+        print(f"  ch{c}: port A reads {d['ar_a']}, DDR3 row opens {d['row_miss']}, "
+              f"read-modify-writes {d['rmw']} (port A / QST {d['rmw_a']})")
+    # the MXU's scale reads (otpu_mxu): 32-byte line requests, and those for a row's Sw alone
+    # (its Sw in neither its first advance's line nor the previous row's last); per MM from the
+    # MXS lines (in issue order = the MMs' dispatch order)
+    xs = st.get("mxu_scale") or []
+    if xs:
+        nmm = sum(1 for r in p.recs if r.op == I.MM and r.slice == 0)
+        print(f"MXU scale lines: {xs[0]['areq']} requests ({xs[0]['areq'] / max(1, nmm):.1f} per "
+              f"MM), {xs[0]['sw']} for a row's Sw alone "
+              f"({100 * xs[0]['sw'] / max(1, xs[0]['areq']):.1f}%)")
+    mxs = [tuple(map(int, m)) for m in re.findall(r"^MXS0 a=(\d+) sw=(\d+)", st["trace"], re.M)]
+    mms = sorted((r for r in p.recs if r.op == I.MM and r.slice == 0), key=lambda r: r.idx)
+    per_mm = dict(zip((r.idx for r in mms), mxs)) if len(mxs) == len(mms) else {}
+    # useful-bytes roofline: weights + their fp32 block scales + KV + activations, at D bytes
+    # per cycle (both channels at 100%)
+    D = cfg.D
+
+    def nbytes(r):
+        if r.op == I.MM:
+            return r.portb * D + r.porta * 4
+        if r.op in (I.LD, I.ST):
+            return 4 * progs[0][r.pc].w[2]
+        if r.op in (I.DSTEP, I.STREAM):
+            return r.portb * D
+        return r.porta if r.op == I.QST else 0
+
+    useful = sum(nbytes(r) for r in p.recs)
+    ub = useful / D * 100 / a.bw
+    print(f"useful bytes {useful} -> {ub:.0f} cycles at {D} B/cycle x {a.bw}% (the core's "
+          f"port): efficiency {100 * ub / p.cycles:.1f}%")
+    if a.ddr:
+        print(f"DRAM efficiency {100 * dram_efficiency(useful, p.cycles, a.ddr, a.mhz):.1f}% "
+              f"(DDR3-{a.ddr:.0f} peak {ddr3_peak(a.ddr) / 1e9:.2f} GB/s = "
+              f"{ddr3_peak(a.ddr) / a.mhz / 1e6:.1f} B per core cycle at {a.mhz:g} MHz; "
+              f"{useful / p.cycles * a.mhz / 1e3:.2f} GB/s moved)")
+    print(f"at {a.mhz:g} MHz: {p.cycles / a.mhz / 1e3:.2f} ms/token, "
+          f"{a.mhz * 1e6 / p.cycles:.1f} tok/s (simulated cycles, no host time)")
+    print(p.summary())
+    print(f"phases: cycles, share, useful bytes -> cycles at {a.bw}% (their roofline), "
+          f"VPU busy, MXU busy")
+    pb = defaultdict(int)
+    for r in p.recs:
+        pb[_phase(progs[0][r.pc])] += nbytes(r)
+    for k, v in sorted(p.phases(lambda r: _phase(progs[0][r.pc])).items(),
+                       key=lambda x: -x[1]["cycles"]):
+        rl_ph = pb[k] / D * 100 / a.bw
+        print(f"  {k:12s} {v['cycles']:9d} {100 * v['cycles'] / p.cycles:5.1f}%  "
+              f"{pb[k]:10d} B -> {rl_ph:9.0f} ({100 * rl_ph / max(1, v['cycles']):5.1f}%)  "
+              f"VPU {v['VPU']:9d}  MXU {v['MXU']:9d}")
+    if a.gaps:
+        _gap_table(p, progs, pb, D * a.bw / 100)
+    ph = defaultdict(lambda: [0, 0, 0, 0, 0])
+    for r in p.recs:
+        if r.op != I.MM or r.end < 0:
+            continue
+        k = _src(progs[0][r.pc])
+        ph[k][0] += 1
+        ph[k][1] += r.portb
+        ph[k][2] += r.end - max(r.start, r.release)
+        if r.slice == 0 and r.idx in per_mm:
+            ph[k][3] += per_mm[r.idx][0]
+            ph[k][4] += per_mm[r.idx][1]
+    print("MM by source: count, chunks, release->end cycles"
+          + (", scale lines, of them Sw alone" if per_mm else ""))
+    for k, v in sorted(ph.items(), key=lambda x: -x[1][1])[:20]:
+        print(f"  {k:50s} {v[0]:6d} {v[1]:9d} {v[2]:9d}"
+              + (f" {v[3]:9d} {v[4]:9d}" if per_mm else ""))
+    g = p.mxu_gaps(0)
+    print(f"MXU prologue {g['prologue']} epilogue {g['epilogue']} "
+          f"gaps {sum(b - a for a, b, _ in g['gaps'])}")
+    for key, v in sorted(g["blame"].items(), key=lambda x: -x[1])[:15]:
+        src = _src(progs[0][key[1]], 0) if key[1] >= 0 else "?"
+        print(f"  gap {v:8d}  after {key[0]:6s} pc={key[1]:5d} {src}")
+    for k, v in sorted(p.by_class(0).items(), key=lambda x: -x[1]["busy"]):
+        print(f"  {k:7s} n={v['count']:6d} busy={v['busy']:9d} work={v['work']:9d} "
+              f"wait_dep={v['wait_dep']:9d} wait_unit={v['wait_unit']:9d}")
+    if a.timeline:
+        lo, hi = (int(x) for x in a.timeline.split(":"))
+        for r in p.slice_recs(0)[lo:hi]:
+            print(f"  #{r.idx:5d} pc={r.pc:4d} {r.name:9s} {r.detail:28s} disp={r.dispatch:8d} "
+                  f"rdy={r.ready:8d} st={r.start:8d} rel={r.release:8d} end={r.end:8d}  "
+                  f"{_src(progs[0][r.pc], 0)}")
+    if a.idle:
+        b = p.buckets[0]
+        util = [(c, n, bm + bd) for c, n, bm, bd in zip(b["c"], b["n"], b["bm"], b["bd"])]
+        tot, run = 0, None
+        for c, n, u in util:
+            lost = n - u
+            tot += max(0, lost)
+            if lost > n // 8:
+                if run and c - n <= run[1] + 1:
+                    run = (run[0], c, run[2] + lost)
+                else:
+                    if run and run[2] > 300:
+                        print(f"  idle {run[2]:6d} in [{run[0]}, {run[1]}]")
+                    run = (c - n, c, lost)
+        if run and run[2] > 300:
+            print(f"  idle {run[2]:6d} in [{run[0]}, {run[1]}]")
+        print(f"  port-B idle cycles total {tot}")
+    if a.json:
+        _json_line(a, p, progs, cfg, R, hacked, pb, D)
+    if a.dump:
+        import json
+        from opentpu import lens as L
+        Path(a.dump).write_text(json.dumps(L.to_data(p)))
+    if a.check:
+        m = Machine(cfg, [progs[0]], [dram.copy()], args)
+        m.run()
+        ok = np.array_equal(m.slices[0].dram[:img.nbytes], drams[0][:img.nbytes])
+        print("bit-exact vs ISA:", ok)
+
+
+if __name__ == "__main__":
+    main()

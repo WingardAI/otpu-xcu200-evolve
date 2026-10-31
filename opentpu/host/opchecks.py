@@ -1,0 +1,277 @@
+"""One small program per instruction variant, for otpu-diag's ISA coverage (and
+tests/test_board.py on the board model).
+
+op_checks(cfg, gen, waitw, gather) -> [(group, name, program)]; every program starts from diag_image() in DRAM,
+stores what it computed below checks.PROG_AT, and is compared with the ISA simulator bit for bit
+by checks.run_demo. The programs are self-contained on the card too, where TMEM and the ACT RAM
+keep the previous run's contents: they only store TMEM words they wrote, and every MM reads ACT
+RAM blocks its own QACT filled.
+
+Groups (otpu-diag's diagnosis keys on them): control, dma, mxu, quant, collective, vpu,
+vpu-reduce, vpu-composite, vpu-edge, vpu-new (RDOT / OUTER / LOG2, which bitstreams before
+ddec900 lack), gen (RLD, VOP ARGMAX, HALT CHAIN: the decode loop's instructions, CAPS bit30;
+only with gen=True), waitw (WAITW whose condition holds, CAPS bit31; only with waitw=True);
+collective's GATHER only with gather=True (CAPS2 bit0: a one-slice bitstream may run BAR alone).
+
+The edge values leave out NaN inputs: the RTL and the ISA simulator disagree there (board
+model, 3c270c9): RECIP of a NaN gives 0 in the RTL, NaN in the simulator; MAX / ABS / COPY pass
+a signalling NaN (0x7F800001) through unchanged where the simulator returns 0x7FC00000. The
+models never feed NaN, so this is a documentation gap, not a bring-up blocker.
+"""
+from __future__ import annotations
+
+import numpy as np
+
+from opentpu import isa as I
+
+from .checks import DATA, OUT, SC, W8, demo_image
+
+EDGE = 0x80000                  # DRAM: edge-value fp32 vectors (EDGE_BITS, then reversed)
+EDGE_BITS = [                   # fp32 bit patterns
+    0x00000000, 0x80000000, 0x3F800000, 0xBF800000, 0x3F000000, 0x40000000, 0x40400000,
+    0xBF000000, 0x00800000, 0x80800000, 0x006CE3EE, 0x00000001, 0x7149F2CA, 0xF149F2CA,
+    0x7F7FFFFF, 0xFF7FFFFF, 0x42FC0000, 0x42FE0000, 0x43000000, 0x43480000, 0xC2FC0000,
+    0xC3150000, 0xC3160000, 0xC3480000, 0x7F800000, 0xFF800000, 0x3EAAAAAB, 0xC0490FDB,
+    0x3F7FFFEF, 0x3F800008, 0x1E3CE508, 0x477FE000]
+NE = len(EDGE_BITS)             # 32: 0, -0, +-1, 0.5, 2, 3, -0.5, +-min normal, denormals,
+#                                 +-1e30, +-max, 126, 127, 128, 200, -126, -149, -150, -200,
+#                                 +-inf, 1/3, -pi, 1 -+ ulps, 1e-20, 65504
+
+# TMEM layout (words): the data at 0.., results from RES on
+A, B, RES, TE, TER = 0, 1024, 8192, 12288, 12352
+CHAIN_AT = 0x340000             # DRAM: the program the HALT CHAIN check starts
+
+
+def diag_image(cfg=None) -> np.ndarray:
+    """The op checks' DRAM image: the demo's, the edge values and the program the HALT CHAIN
+    check chains to, with its wait entries after it on a configuration whose sequencer takes
+    them (cfg.SEQ_WC, EXPERIMENTAL: device_config's from the bitstream)."""
+    img = demo_image()
+    e = np.array(EDGE_BITS, np.uint32)
+    img[EDGE:EDGE + 4 * NE] = e.view(np.uint8)
+    img[EDGE + 4 * NE:EDGE + 8 * NE] = e[::-1].copy().view(np.uint8)
+    prog = _chained()
+    w = np.asarray(I.assemble(prog), np.uint32)
+    if cfg is not None and getattr(cfg, "SEQ_WC", False):
+        from opentpu import waits as W
+        w = W.loadable(w, W.entries(w, cfg.D, cfg.S, prog=prog), cfg.D)
+    img[CHAIN_AT:CHAIN_AT + 4 * len(w)] = w.view(np.uint8)
+    return img
+
+
+def _chained() -> list:
+    """The program the HALT CHAIN check chains to: it sees the first one's TMEM."""
+    return [I.vop(I.V_ADD, RES, RES, 0, 1, 64, 64, 64, 0, I.B_SCALAR, 1.0),
+            I.st(OUT + 0x800, RES, 64), I.halt()]
+
+
+def _p(*body) -> list:
+    return [I.ld(DATA, 0, 4096), *body, I.halt()]
+
+
+def _vop(func, bmode=I.B_FULL, rows=3, cols=100) -> list:
+    return _p(I.vop(func, RES, A, B, rows, cols, cols, 256, 256, bmode, imm=0.75),
+              I.st(OUT, RES, rows * cols))
+
+
+def _edge(func, **kw) -> list:
+    return [I.ld(EDGE, TE, 2 * NE),
+            I.vop(func, RES, TE, TER, 1, NE, NE, NE, NE, **kw),
+            I.st(OUT, RES, NE), I.halt()]
+
+
+def _mm(cfg, m=None, qflags=None, pre=(), ab=0, ors=16, **kw) -> list:
+    """QACT m rows (2 blocks) into ACT RAM block ab, then MM over the 16 x 256 int8 weights.
+    The output area is filled from DRAM first (the accumulator of ACC; the gaps of ors > 16)."""
+    m = m or cfg.MCOLS
+    n = ors * m + (m if kw.get("rmax") else 0)
+    return _p(I.qact(0, m, ab, 2, 256, **(qflags or {})), I.ld(DATA + 0x2000, RES, n), *pre,
+              I.mm(W8, SC, RES, 16, 2, 256, ors, m, ab, 8, **kw), I.st(OUT, RES, n))
+
+
+def op_checks(cfg, gen: bool = False, waitw: bool = False,
+              gather: bool = True) -> list[tuple[str, str, list]]:
+    M = cfg.MCOLS
+    out = []
+
+    def add(group, name, prog):
+        out.append((group, name, prog))
+
+    # ---- control flow
+    add("control", "HALT", [I.halt()])
+    add("control", "NOP", _p(I.nop(), I.nop(), I.st(OUT, A, 64)))
+    add("control", "LI / ADDI (register offsets)",
+        _p(I.li(1, 0x400), I.addi(2, 1, 0x100), I.addi(3, 2, -0x40), I.st(OUT, A, 16, ra=1),
+           I.st(OUT, 64, 16, ra=2), I.st(OUT, 128, 16, ra=3)))
+    add("control", "LOOP", _p(I.loop(2, 5), I.addi(1, 1, 256), I.st(OUT, A, 32, ra=1)))
+    add("control", "LOOP nested",
+        _p(I.loop(4, 3), I.loop(2, 4), I.addi(1, 1, 128), I.st(OUT, A, 16, ra=1),
+           I.addi(2, 2, 64), I.st(OUT + 0x4000, 32, 8, ra=2)))
+    add("control", "LOOP count from a register (rcount)",
+        _p(I.li(4, 3), I.loop(2, 2, rcount=4), I.addi(1, 1, 256), I.st(OUT, A, 32, ra=1)))
+    add("control", "LOOP count 0 (skips its body)",
+        _p(I.loop(1, 0), I.st(OUT, A, 32), I.st(OUT + 256, 64, 32)))
+    add("control", "BAR", _p(I.bar(), I.st(OUT, A, 64)))
+
+    # ---- DMA
+    add("dma", "LD / ST aligned", _p(I.st(OUT, A, 1024)))
+    add("dma", "LD unaligned source",
+        [I.ld(DATA + 4, A, 777), I.ld(DATA + 0x1004, 1024, 3), I.st(OUT, A, 777),
+         I.st(OUT + 0x1000, 1024, 3), I.halt()])
+    add("dma", "ST unaligned target",
+        _p(I.st(OUT + 4, A, 777), I.st(OUT + 0x1008, 64, 1), I.st(OUT + 0x103C, 100, 17)))
+    add("dma", "LD / ST short (1..17 words)",
+        _p(*[I.st(OUT + 0x100 * k + 4 * k, 64 * k, 1 + k) for k in range(17)]))
+    add("dma", "LD / ST register offsets (ra dram, rb tmem)",
+        [I.li(1, 0x200), I.li(2, 300), I.ld(DATA, 0, 256, ra=1, rb=2),
+         I.st(OUT, 0, 256, ra=1, rb=2), I.halt()])
+
+    # ---- MXU (and QACT feeding it)
+    add("mxu", "MM", _mm(cfg))
+    add("mxu", "MM UNIT", _mm(cfg, unit=True))
+    add("mxu", "MM ACC", _mm(cfg, acc=True))
+    add("mxu", "MM RMAX", _mm(cfg, rmax=True))
+    add("mxu", "MM ACC RMAX", _mm(cfg, acc=True, rmax=True))
+    add("mxu", "MM UNIT ACC ASCALE",
+        _mm(cfg, pre=[I.ld(SC, 2048, M)], unit=True, acc=True, ascale=2048))
+    add("mxu", "MM M=1", _mm(cfg, m=1))
+    add("mxu", "MM ACT block ab=3", _mm(cfg, ab=3))
+    add("mxu", "MM output row stride ors=40", _mm(cfg, ors=40))
+    add("mxu", "MM registers (ra sa, rb ssa, rc out)",
+        _p(I.qact(0, M, 0, 2, 256), I.li(1, 256), I.li(2, 8), I.li(3, 64),
+           I.ld(DATA + 0x2000, RES, 64 + 16 * M),
+           I.mm(W8, SC, RES, 15, 2, 256, 16, M, 0, 8, ra=1, rb=2, rc=3),
+           I.st(OUT, RES, 64 + 16 * M)))
+
+    # ---- quantizer
+    add("quant", "QACT ROW", _mm(cfg, qflags={"row": True}))
+    add("quant", "QACT CSCALE",
+        _p(I.vop(I.V_ABS, 2048, 3072, 0, 1, 256, 256, 256, 0),
+           I.qact(0, M, 0, 2, 256, cscale=2048),
+           I.mm(W8, SC, RES, 16, 2, 256, 16, M, 0, 8), I.st(OUT, RES, 16 * M)))
+    add("quant", "QACT RSCALE",
+        _p(I.qact(0, M, 0, 2, 256, rscale=3072), I.mm(W8, SC, RES, 16, 2, 256, 16, M, 0, 8),
+           I.st(OUT, RES, 16 * M)))
+    add("quant", "QST dense", _p(I.qst(A, OUT + 0x800, OUT + 0x1800, 2, 2, 256, 256, 1)))
+    add("quant", "QST strided (es=3)",
+        _p(I.qst(512, OUT + 0x2001, OUT + 0x5000, 3, 1, 128, 1024, 3)))
+    add("quant", "QST ROW", _p(I.qst(A, OUT + 0x800, OUT + 0x1800, 3, 2, 256, 256, 1,
+                                     row=True)))
+
+    # ---- collective (one slice: a strided TMEM copy)
+    if gather:
+        add("collective", "GATHER", _p(I.gather(A, RES, 4, 64, 256, 64, 0), I.st(OUT, RES, 256)))
+
+    # ---- VPU: every function under its legal broadcast modes
+    for f, name in I.VFUNCS.items():
+        if f in (I.V_OUTER, I.V_ARGMAX):
+            continue
+        if f in I.READS_B:
+            modes = [("FULL", I.B_FULL), ("ROW", I.B_ROW), ("COL", I.B_COL),
+                     ("SCALAR", I.B_SCALAR)]
+        else:
+            modes = [("", I.B_FULL)]
+        group = ("vpu-new" if f in (I.V_RDOT, I.V_LOG2) else "vpu-reduce" if f in I.REDUCE
+                 else "vpu-composite" if f in (I.V_EXP2, I.V_RECIP, I.V_RSQRT, I.V_EXP2SUB)
+                 else "vpu")
+        for mname, bm in modes:
+            nm = f"VOP {name.upper()}" + (f" {mname}" if mname else "")
+            if f in I.REDUCE:
+                add(group, nm, _p(I.vop(f, RES, A, B, 3, 200, 1, 256, 256, bm, imm=0.75),
+                                  I.st(OUT, RES, 3)))
+            else:
+                add(group, nm, _vop(f, bm))
+    for dname in ("scalar", "column", "one"):
+        add("vpu-new", f"VOP OUTER {dname}",
+            _p(I.vop(I.V_COPY, RES, A, 0, 4, 64, 64, 64, 0),
+               I.outer(RES, 2048, 1024, 3072, 4, 64, 64, 1, dname),
+               I.st(OUT, RES, 256)))
+
+    # ---- VPU on edge values (zeros, denormals, huge, inf, NaN)
+    for f in (I.V_EXP2, I.V_RECIP, I.V_RSQRT, I.V_EXP2SUB, I.V_LOG2, I.V_ADD, I.V_SUB, I.V_MUL,
+              I.V_MAX, I.V_MIN, I.V_ABS, I.V_COPY):
+        add("vpu-new" if f == I.V_LOG2 else "vpu-edge", f"VOP {I.VFUNCS[f].upper()} edge values",
+            _edge(f))
+    for f in (I.V_RSUM, I.V_RMAX, I.V_RSSQ):
+        add("vpu-edge", f"VOP {I.VFUNCS[f].upper()} edge values",
+            [I.ld(EDGE, TE, 2 * NE), I.vop(f, RES, TE, 0, 2, NE // 2, 1, NE // 2, 0),
+             I.st(OUT, RES, 2), I.halt()])
+    if gen:
+        out += _gen_checks()
+    if waitw:
+        out += _waitw_checks()
+    return out
+
+
+def _fill1(t, v):
+    return I.vop(I.V_FILL, t, 0, 0, 1, 1, 0, 0, 0, I.B_SCALAR, v)
+
+
+def _gen_checks() -> list:
+    """The decode loop's instructions (docs/isa.md RLD, ARGMAX, HALT CHAIN). A register's value
+    shows as the address a store lands at."""
+    out = []
+    # RLD: truncation (4.0, 128.75, -8.5, 0.99, 1024), inf -> 0x80000000 (+ 0x80000000 = 0),
+    # RAW bits (EDGE[11] = 0x00000001, a TMEM offset), rd = 0 (no write)
+    vals = [4.0, 128.75, -8.5, 0.99, 1024.0]
+    prog = [I.ld(EDGE, TE, 2 * NE)] + [_fill1(RES + k, v) for k, v in enumerate(vals)]
+    prog += [I.rld(1 + k, RES + k) for k in range(len(vals))]
+    prog += [I.rld(6, TE + 24), I.addi(6, 6, 0x80000000), I.rld(7, TE + 11, raw=True),
+             I.rld(0, RES + 4)]
+    prog += [I.st(OUT + 0x400 * k, 16 * k, 16, ra=1 + k) for k in range(len(vals))]
+    prog += [I.st(OUT + 0x2000, 96, 16, ra=6),
+             I.vop(I.V_COPY, RES + 16, A, 0, 1, 8, 8, 8, 0, ra=7),
+             I.st(OUT + 0x3000, RES + 16, 16), I.st(OUT + 0x3800, 112, 16, ra=0)]
+    out.append(("gen", "RLD (truncation, inf, RAW, register offsets)", _p(*prog)))
+    # RLD MUL: times w2 mod 2^32 (a PLE row's bytes, 262143 * 9344 > 2^31), a negative
+    # multiplier, RAW bits times 3, a product past 2^32; each register brought back to an offset
+    mv = [(262143.0, 9344, False), (-5.0, -7, False), (3.0, 3, True), (65536.0, 65537, False)]
+    prog = [_fill1(RES + k, v) for k, (v, _, _) in enumerate(mv)]
+    for k, (v, c, raw) in enumerate(mv):
+        x = I.f32bits(v) if raw else I.f2i(I.f32bits(v))
+        prog += [I.rld(1 + k, RES + k, raw=raw, mul=c),
+                 I.addi(1 + k, 1 + k, 0x400 * (k + 1) - x * c),
+                 I.st(OUT, A + 16 * k, 16, ra=1 + k)]
+    out.append(("gen", "RLD MUL (mod 2^32, negative, RAW)", _p(*prog)))
+    # RLD drives a LOOP count and a conditional HALT (LOOP R {HALT} with R = 0: no halt)
+    out.append(("gen", "RLD loop count, conditional HALT",
+                _p(_fill1(RES, 3.0), _fill1(RES + 1, 0.0), I.rld(4, RES), I.rld(5, RES + 1),
+                   I.loop(2, 0, rcount=4), I.addi(1, 1, 256), I.st(OUT, A, 32, ra=1),
+                   I.loop(1, 0, rcount=5), I.halt(), I.st(OUT + 0x2000, A, 32))))
+    # ARGMAX: rows, a row stride of 3, a negative index base plus a register
+    out.append(("gen", "VOP ARGMAX rows, drs, index base",
+                _p(I.li(3, 1000), I.argmax(RES, A, 5, 200, drs=3, ars=256, base=-7, rd=3),
+                   I.argmax(RES + 32, A + 7, 1, 1500), I.st(OUT, RES, 40))))
+    out.append(("gen", "VOP ARGMAX edge values",
+                [I.ld(EDGE, TE, 2 * NE), I.argmax(RES, TE, 2, NE, drs=2, ars=NE),
+                 I.argmax(RES + 4, TE, 4, NE // 2, drs=2, ars=NE // 2),
+                 I.st(OUT, RES, 12), I.halt()]))
+    # HALT CHAIN: the chained program starts from DRAM with the first one's TMEM
+    out.append(("gen", "HALT CHAIN",
+                [I.vop(I.V_FILL, RES, 0, 0, 1, 64, 64, 64, 0, I.B_SCALAR, 41.0),
+                 I.li(1, CHAIN_AT), I.li(2, len(_chained())), I.li(3, 7),
+                 I.halt(chain=True, ra=1, rb=2)]))
+    return out
+
+
+def _waitw_checks() -> list:
+    """WAITW whose condition holds (a word the host would write is in DRAM already): each word
+    it takes shows, through RLD RAW, as the address a store lands at."""
+    # EDGE_BITS[0] = 0, [1] = 0x80000000, [2] = 0x3F800000
+    conds = [(EDGE + 8, 0x3F800000, I.C_EQ, 0xFFFFFFFF), (EDGE, 1, I.C_NE, 0xFFFFFFFF),
+             (EDGE + 4, 0x7FFFFFFF, I.C_GE, 0xFFFFFFFF), (EDGE + 8, 0x3F800000, I.C_EQ, 0xFFFF0000)]
+    prog = []
+    for k, (a, ref, cmp, mask) in enumerate(conds):
+        v = EDGE_BITS[(a - EDGE) // 4]
+        prog += [I.waitw(a, RES + k, ref, cmp, mask=mask, interval=16, timeout=1 << 20),
+                 I.rld(1 + k, RES + k, raw=True), I.addi(1 + k, 1 + k, 0x400 * (k + 1) - v),
+                 I.st(OUT, A + 16 * k, 16, ra=1 + k)]
+    out = [("waitw", "WAITW EQ / NE / GE / mask", _p(*prog))]
+    # a store to the word lands before WAITW's first read; a younger store to it waits
+    out.append(("waitw", "WAITW after a store",
+                _p(_fill1(RES + 8, 5.0), I.st(OUT + 0x2000, RES + 8, 1),
+                   I.waitw(OUT + 0x2000, RES + 9, I.f32bits(5.0), I.C_EQ, timeout=1 << 20),
+                   _fill1(RES + 8, 6.0), I.st(OUT + 0x2000, RES + 8, 1),
+                   I.rld(1, RES + 9, raw=True), I.addi(1, 1, 0x100 - I.f32bits(5.0)),
+                   I.st(OUT + 0x3000, A, 16, ra=1))))
+    return out

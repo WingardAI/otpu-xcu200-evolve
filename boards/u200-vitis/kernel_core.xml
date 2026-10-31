@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<root versionMajor="1" versionMinor="0">
+  <kernel name="OtpuCoreKernel" language="ip_c" vlnv="xilinx.com:RTLKernel:OtpuCoreKernel:1.0"
+          attributes="" preferredWorkGroupSizeMultiple="0" workGroupSize="1" interrupt="true">
+    <ports>
+      <port name="m_axi_bank_0" portType="addressable" mode="master"
+            base="0x0" range="0xFFFFFFFFFFFFFFFF" dataWidth="512"></port>
+      <port name="m_axi_bank_1" portType="addressable" mode="master"
+            base="0x0" range="0xFFFFFFFFFFFFFFFF" dataWidth="512"></port>
+      <port name="m_axi_bank_2" portType="addressable" mode="master"
+            base="0x0" range="0xFFFFFFFFFFFFFFFF" dataWidth="512"></port>
+      <port name="m_axi_bank_3" portType="addressable" mode="master"
+            base="0x0" range="0xFFFFFFFFFFFFFFFF" dataWidth="512"></port>
+      <port name="s_axi_control" portType="addressable" mode="slave"
+            base="0x0" range="0x1000" dataWidth="32"></port>
+    </ports>
+    <args>
+      <!-- one 64-bit pointer arg per AXI master (XRT requires it); the kernel captures each
+           base from the control writes: channel c at 0x300 + 8c (low/high halves) -->
+      <arg id="0" name="Dram0" addressQualifier="1" port="m_axi_bank_0"
+           hostOffset="0x0" hostSize="0x8" offset="0x300" type="unsigned int*"></arg>
+      <arg id="1" name="Dram1" addressQualifier="1" port="m_axi_bank_1"
+           hostOffset="0x0" hostSize="0x8" offset="0x308" type="unsigned int*"></arg>
+      <arg id="2" name="Dram2" addressQualifier="1" port="m_axi_bank_2"
+           hostOffset="0x0" hostSize="0x8" offset="0x310" type="unsigned int*"></arg>
+      <arg id="3" name="Dram3" addressQualifier="1" port="m_axi_bank_3"
+           hostOffset="0x0" hostSize="0x8" offset="0x318" type="unsigned int*"></arg>
+    </args>
+    <compileWorkGroupSize x="1" y="1" z="1"></compileWorkGroupSize>
+    <maxWorkGroupSize x="1" y="1" z="1"></maxWorkGroupSize>
+  </kernel>
+</root>

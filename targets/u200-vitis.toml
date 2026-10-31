@@ -1,0 +1,65 @@
+# openTPU as a Vitis RTL kernel on the Alveo U200 (docs/u200.md).
+#
+# The kernel is loaded as an xclbin over PCIe via XRT, into the shell of the official platform
+# xilinx_u200_gen3x16_xdma_2_202110_1 (XDMA + four DDR4 MIG controllers). The accelerator keeps
+# otpu_slice/otpu_board, otpu_native_dram and otpu_mem_ch; the LiteDRAM core (otpu_ld4) is replaced
+# by the AXI bridge and the host XDMA path by xrt::ip/xrt::bo (Phase 1 starts with otpu_ctrl and a
+# scratch AXI master). See docs/u200.md.
+#
+# Phase 1: S=1, MCOLS=4; the core runs at 150 MHz (ap_clk 300 MHz); DDR4-2400 through the shell.
+
+[target]
+name = "u200-vitis"
+kind = "fpga"
+platform_id = 4
+description = "Alveo U200 Vitis RTL kernel: xcu200-fsgd2104-2-e, shell XDMA + 4x DDR4, S=1"
+
+[arch]
+S = 2
+D = 128
+MCOLS = 4
+ACT_BLOCKS = 128
+ACT_ROWS = 16                   # MMs of up to 16 rows (replay), as ypcb-00338 m4; 0: MCOLS
+TMEM_WORDS = 32768
+IMEM_WORDS = 32768
+DRAM_BYTES = 4294967296         # per slice: 2 GiB of each of its two channels
+LANES = 8
+PAIR = true
+DSTEP = true
+STREAM = true
+SEQ_WC = true                   # WAITC v2 wait entries (docs/seq_vpu.md), as ypcb-00338 m4; needs WIN <= 16
+
+[uarch]
+MXU_IMPL = 2
+MXU_CL = 16
+MXU_E = 4                      # epilogue lanes, as the ypcb-00338 m4 (README) config
+VPU_CL = 2
+ULANES = 8
+TMEM_IMPL = 0
+RPB = 0
+WPB = 1
+WIN = 16
+FIFO_DEPTH = 1024
+TRACE_DEPTH = 16384             # the core kernel's trace buffer, as ypcb-00338 (Phase 1's 0 was stale)
+PQ_WIN = 1024
+CHASH = true
+
+[tech]
+family = "xilinxus"             # rtl/tech/xilinxus: DSP48E2 cells
+part = "xcu200-fsgd2104-2-e"    # the U200's device (JTAG ID b37093)
+vendor = "xilinx"
+
+[platform]
+board = "u200-vitis"            # rtl/boards/u200-vitis/otpu_u200_kernel.sv
+core_mhz = 150.0                # core clock from ap_clk 300 MHz (MMCM), Phase 1
+mem = "ddr4"
+mem_mts = 2400                  # the shell's DDR4-2400 MIG controllers
+mem_ctrl = "shell"              # the platform shell owns the MIG/calibration
+hostcal = false
+channels_per_slice = 2
+channel_bytes = 2147483648      # 2 GiB per channel, xrt::bo base passed as a kernel arg
+channel_phys_bytes = 17179869184  # a 16 GiB RDIMM
+beat_bytes = 64
+host = "xrt"                    # xrt::ip for registers, xrt::bo for DRAM
+pcie_gen = 3
+pcie_lanes = 16

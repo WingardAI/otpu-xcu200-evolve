@@ -1,0 +1,334 @@
+import collections
+import getpass
+import os
+import shutil
+import tempfile
+import time
+
+import numpy as np
+import pytest
+
+from opentpu import rtlsim
+from opentpu.host import regs as R
+from opentpu.host.fake import FakeTransport
+
+# the tests quantize afresh, not through a host's image cache (opentpu/qcache.py), unless one
+# is set (test_qcache.py sets its own)
+os.environ.setdefault("OTPU_IMAGE_CACHE", "0")
+# and build their images afresh, whatever the environment sets: opentpu/imgcache.py's key does
+# not see the module constants the tests patch either (test_imgcache.py sets its own)
+os.environ["OTPU_IMG_CACHE"] = "0"
+# and compile afresh, whatever the environment sets: opentpu/progcache.py's key does not see the
+# module constants and compile functions the tests patch (a gate's OTPU_PROG_CACHE handed
+# prefill.r_max's rows back from disk past a patched compile_prompt_run); the cache's own tests
+# set theirs
+os.environ["OTPU_PROG_CACHE"] = "0"
+
+
+def pytest_addoption(parser):
+    parser.addoption("--runslow", action="store_true",
+                     help="also run the tests marked slow (full-size models on the RTL)")
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "slow: long; runs only with --runslow")
+    # a temporary root of this session's own: pytest's default (<tmp>/pytest-of-<user>, the newest
+    # three kept) let gates running side by side on one host remove each other's directories
+    # mid-run (fix-core's the build host gate: the progcache tests and a wall-clock test failed, and
+    # passed again with a --basetemp of their own); removed at the end, as pytest's own are
+    if config.option.basetemp is None:
+        parent = os.path.join(tempfile.gettempdir(), f"pytest-of-{getpass.getuser()}")
+        os.makedirs(parent, exist_ok=True)      # pytest makes the basetemp, not its parent
+        config.option.basetemp = os.path.join(parent, f"pid-{os.getpid()}")
+        config._otpu_basetemp = config.option.basetemp
+    # and a device-lock / status directory of its own (opentpu/host/runstate.py, default
+    # /tmp/otpu; the tests that check it set theirs): a fake board one gate left open held
+    # /tmp/otpu/fake0.lock, and a gate beside it on the build host failed test_board's run-clock test
+    # with DeviceBusy. Not under the basetemp, which pytest empties on its first tmp_path.
+    config._otpu_run_dir = os.path.join(tempfile.gettempdir(),
+                                        f"otpu-run-{getpass.getuser()}-{os.getpid()}")
+    os.environ["OTPU_RUN_DIR"] = config._otpu_run_dir
+
+
+def pytest_unconfigure(config):
+    own = getattr(config, "_otpu_basetemp", None)
+    if own:
+        shutil.rmtree(own, ignore_errors=True)
+    run = getattr(config, "_otpu_run_dir", None)
+    if run:
+        shutil.rmtree(run, ignore_errors=True)
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--runslow"):
+        return
+    skip = pytest.mark.skip(reason="slow: needs --runslow")
+    for item in items:
+        if "slow" in item.keywords:
+            item.add_marker(skip)
+
+
+def skip_reasons(reports) -> list[tuple[int, str]]:
+    """The skipped tests' reasons with their counts, the most frequent first."""
+    n = collections.Counter()
+    for r in reports:
+        why = r.longrepr[2] if isinstance(r.longrepr, tuple) else str(r.longrepr)
+        n[why.removeprefix("Skipped: ")] += 1
+    return sorted(((k, why) for why, k in n.items()), key=lambda x: (-x[0], x[1]))
+
+
+def pytest_terminal_summary(terminalreporter):
+    """A gate's skips by reason (a missing checkpoint, no Verilator, a slow test, ...): its "N
+    skipped" alone does not say which coverage the run did not have."""
+    skipped = terminalreporter.stats.get("skipped", [])
+    if skipped:
+        terminalreporter.write_sep("-", f"{len(skipped)} skipped, by reason")
+        for k, why in skip_reasons(skipped):
+            terminalreporter.write_line(f"{k:5d}  {why}")
+
+
+def rel(a, b):
+    return float(np.linalg.norm(np.asarray(a, np.float64) - b) / np.linalg.norm(b))
+
+
+def sim_board_config(**kw):
+    """isasim.board_config for the board model this session simulates: with the sequencer's
+    wait entries (SEQ_WC, CFG_UARCH bit24) where its uarch builds them (rtlsim.UARCH: the
+    board's under OTPU_UARCH=board, where the card's m4 takes them; none on the default
+    uarch's), as device_config takes them from the bitstream on the card. A keyword overrides."""
+    from opentpu.isasim import board_config
+    kw.setdefault("SEQ_WC", bool(rtlsim.UARCH.get("SEQ_WC")))
+    return board_config(**kw)
+
+
+def assert_same_state(ri, rr):
+    """RTL and ISA simulator must agree bit for bit on every slice's DRAM and TMEM."""
+    for s, (a, b) in enumerate(zip(ri.drams, rr.drams)):
+        bad = np.nonzero(a != b)[0]
+        assert len(bad) == 0, f"slice {s}: {len(bad)} DRAM bytes differ, first at {bad[:8]}"
+    for s, (a, b) in enumerate(zip(ri.tmems, rr.tmems)):
+        bad = np.nonzero(a != b)[0]
+        assert len(bad) == 0, f"slice {s}: {len(bad)} TMEM words differ, first at {bad[:8]}"
+
+
+
+def assert_fill_is_transparent(make, toks):
+    """Step programs compiled with fill (qwen3.fill_logits, the card's streamed decode) against
+    the plain ones on the ISA simulator: the logits and every slice's DRAM after each step,
+    bit for bit. make() builds an Engine. The filling engine's TMEM is random before each step
+    (the simulator keeps TMEM between runs, as the card does): no step program reads what an
+    earlier run left there, so the fill's tile can take no state the steps keep across tokens."""
+    a, b = make(), make()
+    a.image.stream_fill = True
+    rng = np.random.default_rng(11)
+    for t in toks:
+        for s in a.backend.machine.slices:
+            s.tmem[:] = rng.integers(0, 1 << 32, s.tmem.shape, np.uint64).astype(s.tmem.dtype)
+        assert np.array_equal(a.step(t).view(np.uint32), b.step(t).view(np.uint32)), a.pos
+    for sa, sb in zip(a.backend.machine.slices, b.backend.machine.slices):
+        assert np.array_equal(sa.dram, sb.dram)
+
+
+def waits_programs(eng) -> list:
+    """Every program eng runs from now on, each once (slice 0's): its backend's runs (the steps,
+    the decode, prompt, layer and expert runs, the generate loop's first) and its generate
+    programs (every bucket's: the ones HALT CHAIN chains to as well)."""
+    seen, progs = set(), []
+
+    def keep(ps):
+        for part in ps if isinstance(ps, tuple) else (ps,):     # (a split generate program)
+            if id(part[0]) not in seen:
+                seen.add(id(part[0]))
+                progs.append(part[0])
+    run = eng.backend.run
+
+    def run_(programs, *a, **kw):
+        keep(programs)
+        return run(programs, *a, **kw)
+    eng.backend.run = run_
+    gen = eng._generate_prog
+
+    def gen_(*a, **kw):
+        ps = gen(*a, **kw)
+        keep(ps)
+        return ps
+    eng._generate_prog = gen_
+    return progs
+
+
+def assert_waits_exact(progs, cfg) -> int:
+    """The waits pass's entries (opentpu/waits.py: _MemoPass, wait_counts' default) are the
+    exact pass's (_Pass, memo=False) on every program; returns the instructions compared."""
+    from opentpu import waits as W
+    n = 0
+    for p in progs:
+        a, b = W.wait_counts(p, cfg.D, cfg.S, memo=False), W.wait_counts(p, cfg.D, cfg.S)
+        assert np.array_equal(a, b), f"{int((a != b).sum())} of {len(p)} entries differ"
+        n += len(p)
+    return n
+
+
+def assert_drains_keep_up(progs, cfg, allow=None) -> int:
+    """No MM of the programs drains slower than its array (compiler.slow_drains: its output
+    rows at a stride that puts a replay group's results in too few TMEM banks), but those
+    allow(ins) accepts; returns the MMs checked."""
+    from opentpu import isa as I
+    from opentpu.compiler import slow_drains
+    slow = sorted({c for p in progs for pc, c in slow_drains(p, cfg)
+                   if allow is None or not allow(p[pc])})
+    assert not slow, f"MMs that drain slower than their array: {slow[:8]}"
+    return sum(ins.op == I.MM for p in progs for ins in p)
+
+
+GUARD = 1 << 16       # bytes: more than an attention block's tokens of any KV region
+
+
+@pytest.fixture
+def guarded(monkeypatch):
+    """Images built while it is active leave GUARD bytes after every allocation (qwen3._Bump,
+    which every model's image uses); poison_past_cap fills those after the KV regions."""
+    from opentpu.llm import qwen3
+    alloc = qwen3._Bump.alloc
+    monkeypatch.setattr(qwen3._Bump, "alloc", lambda self, n: alloc(self, n + GUARD))
+    return poison_past_cap
+
+
+def poison_past_cap(eng) -> int:
+    """Fill the guards after every KV head's regions (K rows, K scales, V^T, V scales: cap
+    tokens each) of a `guarded` image with 0xFF bytes (fp32 -NaN words, int8 -1): a program
+    that reads past the cache's capacity reads them. Returns the regions poisoned."""
+    from opentpu.compiler import Affine, k_scale_bytes
+    img = eng.image
+    cap, D = img.cap, img.cfg.D
+    bad = np.full(GUARD, 0xFF, np.uint8)
+    n = 0
+    for s in range(img.cfg.S):
+        m = img.descriptors(s)
+        for li in range(img.spec.layers):
+            for kv in getattr(m.layer(li), "kvs", ()):
+                for r in kv.heads.values():
+                    for name, size in (("k", cap * kv.d), ("ks", cap * k_scale_bytes(kv.d, D)),
+                                       ("vt", kv.d * cap), ("vs", 4 * cap)):
+                        eng.backend.write(s, Affine.of(r[name]).static() + size, bad)
+                        n += 1
+    return n
+
+@pytest.fixture(scope="session")
+def have_verilator():
+    import shutil
+    if shutil.which("verilator") is None:
+        pytest.skip("verilator not installed")
+    return True
+
+
+class IsaCard(FakeTransport):
+    """A fake card that computes: RUN runs the loaded program on the ISA simulator over the
+    channel memories (with args, CAPS bit25: and ARG0..7). What the run writes shows at once,
+    except [late_addr, +late_n) (the logits): piece i of `piece` bytes shows at run_s * (0.4 +
+    0.5 * i / pieces), its first half of beats a little before the rest (the beats of one
+    store land out of order); a piece ending inside a 128-byte beat pair carries the bytes after
+    it as the run left them (a region of one row of 4 * vocab bytes: the next row's). With
+    fill_at (a fraction of the run, or a function of the run number giving it) a program that
+    fills its logits itself (qwen3.fill_logits) shows the region as it was before the run, and
+    ICOUNT 0, until then; FILL_SENTINEL and the whole PROG_N after. With anchor (a function of
+    the run number: True for the runs it holds) such a run's timeline (the fill, the pieces,
+    HALTED) starts at the host's first look instead of at RUN: its first ICOUNT read or memory
+    read (a card as late as the host, however late that is; a host that never looks gets the
+    run after a second)."""
+    streams = True
+
+    def __init__(self, cfg, late, piece, run_s=0.06, fill_at=None, anchor=None, **kw):
+        super().__init__(ch_bytes=cfg.DRAM_BYTES // 2, devname=None, run_s=run_s, **kw)
+        self.cfg, self.late, self.piece, self.fill_at = cfg, late, piece, fill_at
+        self.anchor = anchor
+        self.pending = []                                 # (time, channel, offset, bytes)
+        self.t_fill = None
+        self.ahead = None                                 # a held run's (t0, its pending)
+
+    def _flat(self):
+        from opentpu.host.board import join
+        return join([c for c in self.ch])
+
+    def _apply(self):
+        now = time.perf_counter()
+        keep = []
+        for t, c, off, b in self.pending:
+            if t <= now:
+                self.ch[c][off:off + len(b)] = b
+            else:
+                keep.append((t, c, off, b))
+        self.pending = keep
+
+    def _look(self):
+        """A held run starts its timeline now."""
+        t0, ev = self.ahead
+        d = time.perf_counter() - t0
+        self.pending += [(t + d, c, off, b) for t, c, off, b in ev]
+        self.t_fill = None if self.t_fill is None else self.t_fill + d
+        self.t_run, self.ahead = t0 + d, None
+
+    def reg_write(self, off, val):
+        from opentpu import isa as I
+        from opentpu.host.board import FILL_SENTINEL, split
+        from opentpu.isasim import Machine
+        rising = off == R.R_CTRL and val & R.CTRL_RUN and \
+            not self.regs[R.R_CTRL] & R.CTRL_RUN
+        super().reg_write(off, val)
+        if not rising:
+            return
+        self._apply()
+        dram = self._flat()
+        a, n = self.regs[R.R_PROG_ADDR], self.regs[R.R_PROG_N]
+        w = dram[a:a + 32 * n].view(np.uint32).reshape(n, 8)
+        prog = [I.Instr.decode(x) for x in w]
+        args = [self.regs.get(R.R_ARG0 + 4 * k, 0) for k in range(8)] if self.args else None
+        m = Machine(self.cfg, [prog], [dram.copy()], args)
+        m.run()
+        new = m.slices[0].dram
+        la, ln = self.late
+        t0 = self.t_run = time.perf_counter()           # the run starts now
+        new_late = new[la:la + ln].copy()
+        new[la:la + ln] = dram[la:la + ln]                # the logits come later
+        for c, off, part in split(0, new):
+            self.ch[c][:] = part
+        self.t_fill, self.ahead, ev = None, None, []
+        fills = any(x.op == I.RLD and x.rd == 0 for x in prog[:64])
+        if fills and self.fill_at is not None:
+            f = self.fill_at(self.runs) if callable(self.fill_at) else self.fill_at
+            self.t_fill = t0 + self.run_s * f
+            lo, hi = la // 128 * 128, -(-(la + ln) // 128) * 128
+            span = self._flat()[lo:hi].copy()             # the run's writes around it
+            span[la - lo:la - lo + ln] = np.full(ln // 4, FILL_SENTINEL, np.uint32).view(np.uint8)
+            for c, off, part in split(lo, span):
+                ev.append((self.t_fill, c, off, part))
+        npieces = -(-ln // self.piece)
+        for i, o in enumerate(range(0, ln, self.piece)):
+            k = min(self.piece, ln - o)
+            t = t0 + self.run_s * (0.4 + 0.5 * i / npieces)
+            buf = new[la + o:la + o + -(-k // 128) * 128].copy()    # whole beats, padded with
+            buf[:k] = new_late[o:o + k]                     # what the run left after the piece
+            for j, (c, off, part) in enumerate(split(la + o, buf)):
+                # channel 0's beats a little before channel 1's
+                ev.append((t + 0.002 * j, c, off, part[:len(part)]))
+        if fills and self.anchor is not None and self.anchor(self.runs):
+            self.t_run, self.ahead = float("inf"), (t0, ev)      # HALTED waits too
+        else:
+            self.pending += ev
+
+    def reg_read(self, off):
+        if self.ahead is not None and (off == R.R_ICOUNT or
+                                       time.perf_counter() - self.ahead[0] > 1.0):
+            self._look()
+            if off == R.R_ICOUNT and self.t_fill is not None:
+                return 0                                  # the fill lands after the look
+        self._apply()
+        if off == R.R_ICOUNT and self.t_fill is not None and \
+                time.perf_counter() < self.t_fill:
+            return 0
+        return super().reg_read(off)
+
+    def mem_read(self, ch, off, n, out=None):
+        if self.ahead is not None:
+            self._look()
+        self._apply()
+        return super().mem_read(ch, off, n, out)

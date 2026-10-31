@@ -1,0 +1,282 @@
+"""FakeTransport: an in-memory card for tests and demos (otpu-smi --fake).
+
+It implements the register protocol the driver uses -- register map 3 (or 4: the CFG_*
+registers; or 5: CAPS2, bit0 GATHER = `gather`; or 2: no MXU_STARVE; or
+1, regmap=1: 8-bit address decode, 0xDEADBEEF for registers v1 does not have) -- over two
+channel memories in RAM (two per slice when `cfg` reports more than one: ICOUNT_s as ICOUNT).
+It computes nothing: a run takes `run_s` seconds of wall time (HALTED rises then), reports
+`cycles` and retires PROG_N instructions; the DRAM keeps what the host wrote.
+
+The free-running counters advance deterministically: every SNAP adds `step` cycles of uptime
+and RATES x step to the others, so two snapshots give exactly RATES as utilization (and a DRAM
+bandwidth of (DRAM_RD + DRAM_WR rates) x 64 B x CORE_KHZ). The trace buffer serves `trace`
+(a list of 64-bit records) with TRACE_COUNT = len(trace) + `trace_extra` (records that fell
+out of the buffer) and TRACE_DROP = `trace_drop`.
+
+With `i2c` (two fake_i2c.OpenDrainBus, e.g. fake_i2c.card_buses()) CAPS announces the I2C pins
+and I2C_CTRL / I2C_IN drive and read those bus models. With `ddr_mts` CAPS bit3 announces the
+DDR_MTS register; without it the register reads 0xDEADBEEF, as on older bitstreams. With
+`args` CAPS bit25 announces the ARG0..7 registers (kept, read back), with regmap=4 the CFG_*
+registers report `cfg` (regs.cfg's keys; default the current target's single-slice values with
+the CFG_HASH its build would report; `seq_wc`: CFG_UARCH bit24, a sequencer that takes wait
+entries, EXPERIMENTAL), with `mx` (default) CAPS bit29, the MX numerics every
+bitstream of this tree has (False: a bitstream before MX, which the host refuses), with `gen`
+CAPS bit30 the decode loop's instructions (it runs nothing either way), with `chash` CAPS bit7
+the hashed
+channel interleave (the run's logits pieces land by that map). `calib` (STATUS CALIB0,
+CALIB1): CTRL takes RUN only while both are set, as the RTL; `ecc_ded`: STATUS ECC_DED (set
+by hand: sticky on the card). Its identity (VERSION: D,
+MCOLS, LANES) is by default the configuration the environment asks for (board_config:
+OTPU_MCOLS, OTPU_LANES), as a card built for it would report; so are its ACT RAM rows
+(`act_rows`, the target's: 16 on the card; MCOLS when MCOLS is given): above MCOLS, CAPS bit24
+announces the ACT_ROWS register and the CFG_HASH is that Config's.
+"""
+from __future__ import annotations
+
+import time
+
+import numpy as np
+
+from . import regs as R
+from .board import XdmaTransport as _Xdma   # (its poll; bound here: tests patch board's name)
+from .board import beat_at
+
+RATES = {"RUNNING": 0.80, "MXU_BUSY": 0.60, "MXU_MAC": 0.50, "VPU_BUSY": 0.12,
+         "QNT_BUSY": 0.05, "DMA_BUSY": 0.03, "TMEM_DENY": 0.01, "DRAM_RD": 0.70,
+         "DRAM_WR": 0.02, "DRAM_WAIT": 0.20, "INSTR": 0.005, "MXU_STARVE": 0.08}
+
+
+def _target_cfg(D: int, MCOLS: int, LANES: int, pair: bool, dstep: bool, stream: bool,
+                act_rows: int = 0, seq_wc: bool = False) -> dict:
+    """The CFG_* registers of the current target's build with these VERSION / CAPS values."""
+    from ..target import arch_hash, current
+    t = current()
+    a, u, p = t.arch, t.uarch, t.platform
+    cfg = dict(S=a["S"], TMEM_WORDS=a["TMEM_WORDS"], IMEM_WORDS=a["IMEM_WORDS"],
+               ACT_BLOCKS=a["ACT_BLOCKS"], DRAM_BYTES=a["DRAM_BYTES"],
+               channels=p["channels_per_slice"], channel_bytes=p["channel_bytes"],
+               MXU_IMPL=u["MXU_IMPL"], TMEM_IMPL=u["TMEM_IMPL"], VPU_CL=u["VPU_CL"],
+               ULANES=u["ULANES"], SEQ_WC=int(seq_wc), platform=t.platform_id)
+    from ..isasim import Config
+    full = Config(**{**a, "D": D, "MCOLS": MCOLS, "LANES": LANES,
+                     "ACT_ROWS": act_rows if act_rows > MCOLS else 0, "PAIR": pair,
+                     "DSTEP": dstep, "STREAM": stream, "SEQ_WC": seq_wc})
+    cfg["hash"] = arch_hash(full)
+    return cfg
+
+
+class FakeTransport:
+    batched = False
+
+    def __init__(self, ch_bytes: int = 1 << 20, regmap: int = 3, devname: str | None = "fake0",
+                 run_s: float = 0.0, cycles: int = 1_000_000, core_khz: int = 100_000,
+                 build_id: int = 0x1234ABCD, temp_code: int = 0x9C4, trace_log2: int = 12,
+                 step: int = 1_000_000, trace: list[int] | None = None, trace_extra: int = 0,
+                 trace_drop: int = 0, D: int | None = None, MCOLS: int | None = None,
+                 LANES: int | None = None,
+                 i2c: list | None = None, ddr_mts: int | None = None,
+                 w4: bool = True, pair: bool = False, dstep: bool = False,
+                 args: bool = False, stream: bool = False, gen: bool = False,
+                 chash: bool = False, calib: tuple = (True, True), ecc_ded: bool = False,
+                 cfg: dict | None = None, act_rows: int | None = None, mx: bool = True,
+                 gather: bool = True, seq_wc: bool = False):
+        self.ch = [np.zeros(ch_bytes, np.uint8) for _ in range(2)]
+        self.v, self.devname, self.dev = regmap, devname, devname and f"/dev/{devname}"
+        self.run_s, self.cycles_per_run = run_s, cycles
+        self.core_khz, self.build_id, self.temp_code = core_khz, build_id, temp_code
+        self.trace_log2, self.step = trace_log2, step
+        self.trace, self.trace_extra, self.trace_drop = list(trace or []), trace_extra, trace_drop
+        if act_rows is None:            # the target's rows, unless MCOLS is the caller's
+            act_rows = MCOLS
+        if None in (D, MCOLS, LANES):
+            from ..isasim import board_config
+            c = board_config()
+            if act_rows is None:
+                act_rows = c.act_rows
+            D, MCOLS, LANES = (c.D if D is None else D, c.MCOLS if MCOLS is None else MCOLS,
+                               c.LANES if LANES is None else LANES)
+        self.version = D << 16 | MCOLS << 8 | LANES
+        self.act_rows = act_rows        # > MCOLS: CAPS bit24 and the ACT_ROWS register
+        self.cfg_words = R.cfg_words(cfg or _target_cfg(D, MCOLS, LANES, pair, dstep, stream,
+                                                        act_rows, seq_wc))
+        self.slices = R.cfg(self.cfg_words)["S"] if regmap >= R.CFG_SINCE else 1
+        if self.slices > 1:             # two channels per slice (board.channel_map)
+            self.ch = [np.zeros(ch_bytes, np.uint8) for _ in range(2 * self.slices)]
+        self.i2c = i2c
+        self.ddr_mts = ddr_mts          # None: a bitstream without the DDR_MTS register
+        self.w4 = w4                    # CAPS bit4: the MXU runs 4-bit weights
+        self.pair = pair                # CAPS bit5: MM PAIR / QACT DUP
+        self.dstep = dstep              # CAPS bit6: DSTEP
+        self.args = args                # CAPS bit25: ARG0..7 (R_ARG0 + 4k, read back)
+        self.stream = stream            # CAPS bit26: the stream engine
+        self.gen = gen                  # CAPS bit30: the decode loop (RLD, ARGMAX, HALT CHAIN)
+        self.chash = chash              # CAPS bit7: the hashed channel interleave
+        self.mx = mx                    # CAPS bit29: the MX numerics (every bitstream of this tree)
+        self.gather = gather            # CAPS2 bit0 (register map 5): the collective's GATHER
+        self.calib = list(calib)        # STATUS CALIB0 / CALIB1
+        self.ecc_ded = ecc_ded          # STATUS ECC_DED
+        self.regs = {R.R_CTRL: 0, R.R_PROG_ADDR: 0, R.R_PROG_N: 0, R.R_SCRATCH: 0,
+                     R.R_TRACE_CTRL: 0, R.R_TRACE_ADDR: 0, R.R_I2C_CTRL: 0}
+        self.count = {k: 0 for k in R.counters(regmap)}
+        self.shadow = dict(self.count)
+        self.snaps = 0
+        self.t_run = None               # wall time RUN rose
+        self._wrote = 0                 # logits pieces written by this run
+        self._t_logits = None           # the run the logits pieces belong to
+        self.runs = 0
+        self.reads = 0                  # register reads (poll cost)
+
+    # ---- memory
+    def mem_write(self, ch, off, data):
+        self.ch[ch][off:off + len(data)] = data
+
+    def mem_read(self, ch, off, n, out=None):
+        self._halted()                  # the run's logits pieces land
+        if out is None:
+            return self.ch[ch][off:off + n].copy()
+        out[:] = self.ch[ch][off:off + n]
+        return out
+
+    # ---- registers
+    streams = False             # DMA during a run (BoardBackend's streamed logits): set with
+    logits = None               # (addr, nbytes, piece): the run writes the region piece by
+    #                             piece, piece i at run_s * (0.5 + 0.5 * (i + 1) / pieces) (an
+    #                             LM head in the run's second half; the last one at the halt)
+    logits_lag = 0.0            # the last piece lands this long after HALTED (a store in flight)
+
+    def _put(self, addr: int, b: np.ndarray) -> None:
+        """Logical bytes at any address into the two channels (64-byte beats alternate; CHASH:
+        board.beat_at's map)."""
+        i = 0
+        while i < len(b):
+            x = addr + i
+            k = min(len(b) - i, 64 - x % 64)
+            c, off = beat_at(x, self.chash)
+            self.ch[c][off:off + k] = b[i:i + k]
+            i += k
+
+    def _halted(self) -> bool:
+        now = time.perf_counter()
+        t_run = self._t_logits          # the stores in flight land even after RUN falls
+        if self.logits is not None and t_run is not None:
+            a, n, piece = self.logits
+            k = -(-n // piece)
+            while self._wrote < k and now - t_run >= self.run_s * (
+                    0.5 + 0.5 * (self._wrote + 1) / k) + (self.logits_lag
+                                                           if self._wrote == k - 1 else 0):
+                o = self._wrote * piece
+                m = min(piece, n - o)
+                vals = (np.arange(o // 4, (o + m) // 4, dtype=np.float32) % 997 * 1e-3)
+                self._put(a + o, vals.view(np.uint8))
+                self._wrote += 1
+        return self.t_run is not None and now - self.t_run >= self.run_s
+
+    def reg_write(self, off, val):
+        if self.v < 2:
+            off &= 0xFF
+            if off >= R.R_REGMAP:
+                return
+        if off == R.R_CTRL:
+            if not (all(self.calib) or self.regs[R.R_CTRL] & R.CTRL_RUN):
+                val &= ~(R.CTRL_RUN | R.CTRL_LOAD)  # (uncalibrated: RUN and LOAD not taken)
+            if val & R.CTRL_RUN and not self.regs[R.R_CTRL] & R.CTRL_RUN:
+                self.t_run = time.perf_counter()
+                self._wrote, self._t_logits = 0, self.t_run
+                self.runs += 1
+            elif not val & R.CTRL_RUN:
+                self.t_run = None
+        if off == R.R_SNAP:
+            self.snaps += 1
+            for k in self.count:
+                self.count[k] += self.step if k == "UPTIME" else int(RATES[k] * self.step)
+            self.shadow = dict(self.count)
+            return
+        if off == R.R_TRACE_CTRL and val & R.TR_CLEAR:
+            return
+        if off == R.R_I2C_CTRL and self.i2c:
+            val &= 0xF
+            for k, bus in enumerate(self.i2c):
+                bus.drive(bool(val >> 2 * k & 1), bool(val >> 2 * k & 2))
+        self.regs[off] = val & 0xFFFFFFFF
+
+    def reg_read(self, off):
+        self.reads += 1
+        if self.v < 2:
+            off &= 0xFF                                  # v1 decodes 8 address bits
+            if off >= R.R_REGMAP:
+                return R.UNMAPPED
+        if off == R.R_ID:
+            return R.ID_OTPU
+        if off == R.R_VERSION:
+            return self.version
+        if off == R.R_STATUS:
+            run = bool(self.regs[R.R_CTRL] & R.CTRL_RUN)
+            h = self._halted()
+            idle = self.logits is None or self._t_logits is None or \
+                self._wrote >= -(-self.logits[1] // self.logits[2])
+            return (R.ST_HALTED if run and h else 0) | (R.ST_WR_IDLE if idle else 0) \
+                | (R.ST_CALIB0 if self.calib[0] else 0) | (R.ST_CALIB1 if self.calib[1] else 0) \
+                | (R.ST_RUN if run else 0) | (R.ST_ECC_DED if self.ecc_ded else 0)
+        if off in (R.R_CYCLES, R.R_CYCLES_HI):
+            c = self.cycles_per_run if self.runs else 0
+            return c & 0xFFFFFFFF if off == R.R_CYCLES else c >> 32
+        if off == R.R_ICOUNT or (self.slices > 1 and R.R_ICOUNT_S + 4 <= off
+                                 < R.R_ICOUNT_S + 4 * self.slices):
+            return self.regs[R.R_PROG_N] if self.runs else 0
+        if off in (R.R_B_RD, R.R_B_WR, R.R_A_RD, R.R_A_WR, R.R_B_STALL):
+            return 0
+        if off == R.R_REGMAP:
+            return self.v
+        if self.v >= R.CFG_SINCE and off in R.CFG_REGS:
+            return self.cfg_words[R.CFG_REGS.index(off)]
+        if self.v >= R.CAPS2_SINCE and off == R.R_CAPS2:
+            return R.CAP2_GATHER if self.gather else 0
+        if off == R.R_CAPS:
+            return (R.CAP_TRACE | R.CAP_TEMP | (R.CAP_I2C if self.i2c else 0)
+                    | (R.CAP_DDR if self.ddr_mts else 0) | (R.CAP_W4 if self.w4 else 0)
+                    | (R.CAP_PAIR if self.pair else 0)
+                    | (R.CAP_DSTEP if self.dstep else 0) | (R.CAP_ARGS if self.args else 0)
+                    | (R.CAP_STREAM if self.stream else 0) | (R.CAP_GEN if self.gen else 0)
+                    | (R.CAP_CHASH if self.chash else 0) | (R.CAP_MX if self.mx else 0)
+                    | (R.CAP_ACT if self.act_rows > self.version >> 8 & 0xFF else 0)
+                    | self.trace_log2 << 8 | 6 << 16)
+        if off == R.R_ACT_ROWS and self.act_rows > self.version >> 8 & 0xFF:
+            return self.act_rows
+        if off == R.R_CORE_KHZ:
+            return self.core_khz
+        if off == R.R_BUILD_ID:
+            return self.build_id
+        if off == R.R_DDR_MTS and self.ddr_mts:
+            return self.ddr_mts
+        if off == R.R_TEMP:
+            return R.TEMP_VALID | self.temp_code
+        if off == R.R_SNAP:
+            return self.snaps
+        if off == R.R_I2C_IN and self.i2c:
+            v = R.I2C_ALERT0
+            for k, bus in enumerate(self.i2c):
+                scl, sda = bus.read()
+                v |= (scl | sda << 1) << 2 * k
+            return v
+        for k, o in R.counters(self.v).items():
+            if off in (o, o + 4):
+                v = self.shadow[k]
+                return v & 0xFFFFFFFF if off == o else v >> 32
+        if off == R.R_TRACE_COUNT:
+            return len(self.trace) + self.trace_extra
+        if off == R.R_TRACE_DROP:
+            return self.trace_drop
+        if off in (R.R_TRACE_LO, R.R_TRACE_HI):
+            a = self.regs[R.R_TRACE_ADDR]
+            rec = self.trace[a] if a < len(self.trace) else 0
+            if off == R.R_TRACE_HI:
+                self.regs[R.R_TRACE_ADDR] = (a + 1) % (1 << self.trace_log2)
+                return rec >> 32
+            return rec & 0xFFFFFFFF
+        return self.regs.get(off, R.UNMAPPED)
+
+    def reg_read_many(self, offs):
+        return [self.reg_read(o) for o in offs]
+
+    def poll(self, off, mask, val, timeout=600.0, expect=0.0):
+        return _Xdma.poll(self, off, mask, val, timeout, expect)

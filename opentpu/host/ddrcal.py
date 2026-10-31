@@ -1,0 +1,821 @@
+"""DDR3 calibration for LiteDRAM's A7DDRPHY from the host (docs/litedram.md, section 7): the
+LiteDRAM test image (tools/litedram/ld_host.py) and the board's bring-up (opentpu/host/memcal.py)
+use it. Stdlib only, no package imports, so a copy next to ld_host.py works on a card
+host whose installed opentpu package predates it.
+
+The CSRs are reached through `csr`, any object with w(name, value) / r(name) on LiteX CSR names
+(csr.csv); Chan(csr, ch) gives channel ch's view (channel 0's names bare, channel 1's with a 1).
+The PHY settings and the JEDEC init sequence come from the generated sdram_init.py (load_config).
+
+Calibration follows LiteX's liblitedram/sdram.c for a PHY without write leveling (A7DDRPHY):
+the JEDEC init sequence through DFII, write latency calibration (the write bitslip, in tCK steps,
+with the best read window after a read scan), then read leveling (read bitslip, IDELAY tap at the
+centre of the widest window). Every scan runs on all nine byte lanes at once (dly_sel selects them
+all; the test pattern checks each lane's bytes), a nine-fold saving over the BIOS's lane-by-lane
+loop; the chosen values are then set lane by lane. The test pattern: LFSR data on every phase,
+written to row 0 / bank 0 / column 0 on the write phase, read back on the read phase.
+
+Write margin: the banks have no ODELAY, so there is no write leveling; the write DQS clock's phase
+(an MMCM output with fine phase shift, 1/56 VCO period per step) moves every lane's DQS against
+CK and against its DQ. dqs_scan scans it over one tCK and, per lane, records where a write latency
+exists with a read window of at least MIN_WINDOW taps and (with a BIST) where a traffic test
+passes: the DFII check alone passed at phases where the BIST failed a lane (section 7). margins
+picks the centre of the range common to all lanes; calibrate_channel does the whole flow.
+"""
+import csv
+import random
+import re
+import time
+from pathlib import Path
+
+MIN_WINDOW = 3            # read taps (78 ps each) for a lane to count as working
+TAP_PS = 1e12 / (32 * 2 * 200e6)   # IDELAYE2 tap at a 200 MHz reference: 78.125 ps
+SEEDS = (42, 84, 36)
+
+
+PREFIXES = ("ddrphy", "sdram", "bist", "phase", "ecc", "cal", "wclk")
+
+
+class Chan:
+    """Channel ch's view of the CSRs: channel 0 keeps the one-channel image's names (ddrphy_*,
+    sdram_*, bist_*, phase_*), channel 1's are ddrphy1_*, sdram1_*, bist1_*, phase1_*."""
+    def __init__(self, csr, ch):
+        self.csr, self.ch, self.sfx = csr, ch, "" if ch == 0 else str(ch)
+
+    def name(self, n):
+        p, _, rest = n.partition("_")
+        return f"{p}{self.sfx}_{rest}" if self.sfx and p in PREFIXES else n
+
+    def w(self, n, v):
+        self.csr.w(self.name(n), v)
+
+    def r(self, n):
+        return self.csr.r(self.name(n))
+
+
+# ------------------------------------------------------------------------------ DRAM
+class Dram:
+    CTL_SEL, CTL_CKE, CTL_ODT, CTL_RESET_N = 1, 2, 4, 8
+    CS, WE, CAS, RAS, WRDATA, RDDATA = 1, 2, 4, 8, 16, 32
+
+    def __init__(self, csr, config):
+        """config: the build's sdram_init.py, or the directory holding it (load_config)."""
+        self.c = csr
+        ns = {}
+        text = Path(load_config(config)).read_text()
+        exec(text, ns)
+        self.phy = ns["phy"]
+        # (comment, address, bank, value, delay, is a DFII control write): the generated header
+        # evaluates the command names; its text tells control writes from commands
+        self.init_sequence = [
+            (c, int(a), int(ba), eval(expr, ns), int(dl), "dfii_control" in expr)
+            for c, a, ba, expr, dl in re.findall(
+                r'\("([^"]*)", (\d+), (\d+), ([a-z_|]+), (\d+)\)', text)]
+        assert len(self.init_sequence) == len(ns["init_sequence"])
+        p = self.phy
+        self.nm, self.nph, self.db = p["modules"], p["nphases"], p["databits"]
+        self.all = (1 << self.nm) - 1
+        self.wb = [0] * self.nm            # write bitslip per lane (as set)
+        self.rb = [0] * self.nm            # read bitslip
+        self.rd = [0] * self.nm            # read delay (taps)
+        # WL7DDRPHY with ddrphy_dly_sel_bits: each DQ bit's read bitslip settable on its own, for
+        # a bit whose ISERDES frames its word a CLK off the rest of its lane (docs section 8)
+        self.per_bit = has_csr(csr, "ddrphy_dly_sel_bits")
+        self.boff = [[0] * 8 for _ in range(self.nm)]     # per-bit read bitslip offsets (as set)
+
+    # DFII
+    def ctl(self, v):
+        self.c.w("sdram_dfii_control", v)
+
+    def cmd(self, ph, c, a=0, ba=0):
+        self.c.w(f"sdram_dfii_pi{ph}_address", a)
+        self.c.w(f"sdram_dfii_pi{ph}_baddress", ba)
+        self.c.w(f"sdram_dfii_pi{ph}_command", c)
+        self.c.w(f"sdram_dfii_pi{ph}_command_issue", 1)
+
+    def pattern(self, seed):
+        rng = random.Random(seed)
+        return [rng.getrandbits(2 * self.db) for _ in range(self.nph)]
+
+    def test(self, seeds=SEEDS):
+        """Write / read back LFSR data on row 0; the wrong bits per lane (rising and falling
+        edge bytes of every phase)."""
+        e = self.test_bits(seeds)
+        return [sum(e[8 * m:8 * m + 8]) for m in range(self.nm)]
+
+    def test_bits(self, seeds=SEEDS):
+        """test(), per DQ bit: its wrong reads (both edges of every phase)."""
+        err = [0] * self.db
+        for s in seeds:
+            pat = self.pattern(s)
+            self.cmd(0, self.RAS | self.CS)                                  # activate row 0
+            for ph in range(self.nph):
+                self.c.w(f"sdram_dfii_pi{ph}_wrdata", pat[ph])
+            self.cmd(self.phy["wrphase"], self.CAS | self.WE | self.CS | self.WRDATA)
+            self.cmd(self.phy["rdphase"], self.CAS | self.CS | self.RDDATA)
+            self.cmd(0, self.RAS | self.WE | self.CS)                        # precharge
+            for ph in range(self.nph):
+                x = self.c.r(f"sdram_dfii_pi{ph}_rddata") ^ pat[ph]
+                while x:
+                    low = x & -x
+                    err[(low.bit_length() - 1) % self.db] += 1
+                    x ^= low
+        return err
+
+    # PHY: dly_sel selects the lanes the next strobes act on
+    def sel(self, mask):
+        self.c.w("ddrphy_dly_sel", mask)
+
+    def strobe(self, name, mask, n=1):
+        self.sel(mask)
+        for _ in range(n):
+            self.c.w(name, 1)
+        self.sel(0)
+
+    def set_wbitslip(self, m, v):
+        self.strobe("ddrphy_wdly_dq_bitslip_rst", 1 << m)
+        self.strobe("ddrphy_wdly_dq_bitslip", 1 << m, v)
+        self.wb[m] = v
+
+    def set_rbitslip(self, m, v):
+        self.strobe("ddrphy_rdly_dq_bitslip_rst", 1 << m)
+        self.strobe("ddrphy_rdly_dq_bitslip", 1 << m, v)
+        self.rb[m] = v
+        self.boff[m] = [0] * 8
+
+    def set_rbitslip_bit(self, m, i, v):
+        """Bit i of lane m alone (ddrphy_dly_sel_bits masks the lane's bitslip strobes)."""
+        self.c.w("ddrphy_dly_sel_bits", 1 << i)
+        try:
+            self.strobe("ddrphy_rdly_dq_bitslip_rst", 1 << m)
+            self.strobe("ddrphy_rdly_dq_bitslip", 1 << m, v)
+        finally:
+            self.c.w("ddrphy_dly_sel_bits", 0xFF)
+        self.boff[m][i] = v - self.rb[m]
+
+    def set_rdelay(self, m, v):
+        self.strobe("ddrphy_rdly_dq_rst", 1 << m)
+        self.strobe("ddrphy_rdly_dq_inc", 1 << m, v)
+        self.rd[m] = v
+
+    def init(self):
+        """PHY reset, the JEDEC sequence, every delay and bitslip reset (software control)."""
+        self.c.w("ddrphy_rdphase", self.phy["rdphase"])
+        self.c.w("ddrphy_wrphase", self.phy["wrphase"])
+        if self.per_bit:
+            self.c.w("ddrphy_dly_sel_bits", 0xFF)
+        self.ctl(self.CTL_CKE | self.CTL_ODT | self.CTL_RESET_N)
+        self.c.w("ddrphy_rst", 1)
+        time.sleep(0.001)
+        self.c.w("ddrphy_rst", 0)
+        time.sleep(0.001)
+        for _comment, a, ba, cmd, delay, control in self.init_sequence:
+            self.c.w("sdram_dfii_pi0_address", a)
+            self.c.w("sdram_dfii_pi0_baddress", ba)
+            if control:
+                self.ctl(cmd)
+            else:
+                self.c.w("sdram_dfii_pi0_command", cmd)
+                self.c.w("sdram_dfii_pi0_command_issue", 1)
+            time.sleep(max(delay / self.phy["sys_hz"] * 4, 20e-6))
+        for name in ("ddrphy_wdly_dq_bitslip_rst", "ddrphy_rdly_dq_rst", "ddrphy_rdly_dq_bitslip_rst"):
+            self.strobe(name, self.all)
+        self.wb, self.rb, self.rd = [0] * self.nm, [0] * self.nm, [0] * self.nm
+        self.boff = [[0] * 8 for _ in range(self.nm)]
+
+    def hardware(self):
+        self.ctl(self.CTL_SEL)
+
+    # scans (all lanes at once)
+    def read_scan(self, seeds=SEEDS):
+        """err[bitslip][tap][DQ bit] at the current write bitslips (every bit at the bitslip)."""
+        d, nb = self.phy["delays"], self.phy["bitslips"]
+        out = []
+        self.strobe("ddrphy_rdly_dq_bitslip_rst", self.all)
+        for b in range(nb):
+            self.strobe("ddrphy_rdly_dq_rst", self.all)
+            row = []
+            for t in range(d):
+                row.append(self.test_bits(seeds))
+                self.strobe("ddrphy_rdly_dq_inc", self.all)
+            out.append(row)
+            self.strobe("ddrphy_rdly_dq_bitslip", self.all)
+        # the scan leaves bitslip 0 (8 increments wrap) and taps wrapped to 0
+        return out
+
+    @staticmethod
+    def windows(taps_err):
+        """The longest run of error-free taps: (start, length)."""
+        best, cur, start = (0, 0), 0, 0
+        for t, e in enumerate(taps_err):
+            if e == 0:
+                if cur == 0:
+                    start = t
+                cur += 1
+                if cur > best[1]:
+                    best = (start, cur)
+            else:
+                cur = 0
+        return best
+
+    def lane_best(self, scan, m):
+        """(window length, bitslip, window start) of lane m's best read bitslip in a scan."""
+        return self.lane_best_bits(scan, m)[:3]
+
+    def lane_best_bits(self, scan, m):
+        """lane_best() and the per-bit bitslip offsets. Every bit of a lane reads at the lane's
+        IDELAY tap. With per_bit, a bit may read at a bitslip two away from its lane's: its
+        ISERDES framed the word a CLK off (ldtest3d: ch1 dq27 +2; dq64, dq67 -2 against the
+        other six of their lane), the same eye at the same taps. The offset per bit is the one
+        that reads right over most of the lane's window."""
+        nb, nd = len(scan), len(scan[0])
+        offsets = (0, 2, -2) if self.per_bit else (0,)
+        best = (0, 0, 0, [0] * 8)
+        for b in range(nb):
+            ok = {(i, o): [0 <= b + o < nb and scan[b + o][t][8 * m + i] == 0 for t in range(nd)]
+                  for i in range(8) for o in offsets}
+            some = [0 if all(any(ok[i, o][t] for o in offsets) for i in range(8)) else 1
+                    for t in range(nd)]
+            start, n = self.windows(some)
+            if n < best[0]:
+                continue
+            offs = [max(offsets, key=lambda o: sum(ok[i, o][start:start + n])) for i in range(8)]
+            start, n = self.windows([0 if all(ok[i, offs[i]][t] for i in range(8)) else 1
+                                     for t in range(nd)])
+            # the widest window; between equals, the fewest bits off the lane's bitslip
+            if (n, -sum(map(bool, offs))) > (best[0], -sum(map(bool, best[3]))):
+                best = (n, b, start, offs)
+        return best
+
+    def write_latency(self, seeds=SEEDS, verbose=True):
+        """Per lane, the write bitslip (0, 2, 4, 6: tCK steps) with the widest read window."""
+        res = {}
+        for wbs in range(0, self.phy["bitslips"], 2):
+            self.strobe("ddrphy_wdly_dq_bitslip_rst", self.all)
+            self.strobe("ddrphy_wdly_dq_bitslip", self.all, wbs)
+            scan = self.read_scan(seeds)
+            res[wbs] = [self.lane_best(scan, m) for m in range(self.nm)]
+        choice = []
+        for m in range(self.nm):
+            wbs = max(res, key=lambda k: res[k][m][0])
+            choice.append(wbs if res[wbs][m][0] > 0 else -1)
+            self.set_wbitslip(m, max(wbs, 0))
+        if verbose:
+            print("write latency: " + " ".join(
+                f"m{m}:{'-' if c < 0 else c}" for m, c in enumerate(choice)))
+            for wbs in res:
+                print(f"  wb{wbs}: " + " ".join(f"{n:2d}" for n, _, _ in res[wbs]) + "  (widest read window per lane, taps)")
+        return choice, res
+
+    def read_leveling(self, seeds=SEEDS, verbose=True):
+        scan = self.read_scan(seeds)
+        out = []
+        for m in range(self.nm):
+            n, b, start, offs = self.lane_best_bits(scan, m)
+            if verbose:
+                line = "".join("1" if all(0 <= b + o < len(scan) and scan[b + o][t][8 * m + i] == 0
+                                          for i, o in enumerate(offs)) else "0"
+                               for t in range(len(scan[0])))
+                print(f"  m{m}: b{b} |{line}| window {n} taps ({n * TAP_PS:.0f} ps)"
+                      + (f", tap {start + n // 2}" if n else "")
+                      + (f", bits' bitslip offsets {offs}" if any(offs) else ""))
+            self.set_rbitslip(m, b)
+            for i, o in enumerate(offs):
+                if o and n:
+                    self.set_rbitslip_bit(m, i, b + o)
+            self.set_rdelay(m, start + n // 2 if n else 0)
+            out.append((n, b, start))
+        err = self.test(seeds)
+        if verbose:
+            print("  check at the chosen taps: " + ("pass" if not any(err) else f"errors per lane {err}"))
+        return out, err
+
+    def calibrate(self, seeds=SEEDS, verbose=True):
+        self.init()
+        wl, _ = self.write_latency(seeds, verbose)
+        if verbose:
+            print("read leveling:")
+        rl, err = self.read_leveling(seeds, verbose)
+        return wl, rl, err
+
+
+# ------------------------------------------------------------------------------ DQS phase
+class DqsPhase:
+    """The write DQS phase (phase_dqs_*), in fine steps since configuration. With `wrap` (fine
+    steps per tCK: a WL7DDRPHY image, whose write CLKDIV may sit at most about half a tCK from
+    sys), every target is moved to its equivalent in [-wrap/2, wrap/2): the same phase against
+    CK, a tCK apart, which the write latency calibration absorbs."""
+    def __init__(self, csr, vco_hz, wrap=None):
+        self.c = csr
+        self.step_ps = 1e12 / vco_hz / 56
+        self.wrap = wrap
+
+    def steps(self):
+        v = self.c.r("phase_dqs_steps")
+        return v - (1 << 32) if v & (1 << 31) else v
+
+    def move(self, target, timeout=5.0):
+        """Shift to `target` steps, a step a shift. A phase that does not get there in `timeout`
+        seconds (busy for good, or not following its shifts; a move takes milliseconds) is a
+        TimeoutError, not a loop that goes on in Board() with the card's lock held."""
+        if self.wrap:
+            target = (target + self.wrap // 2) % self.wrap - self.wrap // 2
+        t0 = time.time()
+        while True:
+            s = self.steps()
+            if s == target:
+                return
+            while True:
+                busy = self.c.r("phase_dqs_busy")
+                if time.time() - t0 > timeout:
+                    raise TimeoutError(f"DQS phase at {s} steps after {timeout} s, moving to "
+                                       f"{target}" + (" (busy)" if busy else ""))
+                if not busy:
+                    break
+            self.c.w("phase_dqs_shift", 1 if target > s else 0)
+
+
+def dqs_phase(csr, phy):
+    """The channel's DqsPhase for a build's PHY settings (its sdram_init.py `phy`)."""
+    period = round(56 * phy["vco_hz"] / (4 * phy["sys_hz"]))
+    return DqsPhase(csr, phy["vco_hz"], wrap=period if phy.get("phy") == "wl" else None)
+
+
+def dqs_scan(dram, dqs, period_steps, stride, seeds=(42,), csr=None, mib=64, show=True):
+    """Per DQS phase step: calibrate (write latency, read leveling) and, with `csr`, write and
+    read back `mib` MiB with the BIST. Per lane: the read window (taps) if its DFI check and its
+    BIST beats are all right, else 0 (the BIST's wrong beats are printed)."""
+    table = {}
+    start = dqs.steps()
+    for k in range(0, period_steps + 1, stride):
+        dqs.move(start + k)
+        wl, rl, err = dram.calibrate(seeds, verbose=False)
+        win = [n if w >= 0 and not e else 0 for (n, _, _), w, e in zip(rl, wl, err)]
+        bad = [0] * dram.nm
+        if csr is not None:
+            dram.hardware()
+            beats = mib * (1 << 20) // 64
+            bist(csr, beats, 0, 0x0123456789ABCDEF + k, dram.phy["sys_hz"])
+            bad = bist(csr, beats, 1, 0x0123456789ABCDEF + k, dram.phy["sys_hz"])["lanes"]
+            win = [0 if b else n for n, b in zip(win, bad)]
+        table[k] = win
+        if show:
+            print(f"  dqs +{k:3d} ({k * dqs.step_ps:6.0f} ps): windows " + " ".join(f"{n:2d}" for n in win)
+                  + "  write latency " + "".join("-" if w < 0 else str(w) for w in wl)
+                  + ("  BIST wrong beats " + " ".join(str(x) for x in bad) if any(bad) else ""))
+    dqs.move(start)
+    return table
+
+
+def margins(table, nm, min_window=MIN_WINDOW, period=None):
+    """Per lane, the passing phase steps; the common passing set; the chosen step (the centre
+    of the longest common run, taken around the circle when the scan covers a whole tCK of
+    `period` steps: the phase wraps) and that run."""
+    ks = sorted(table)
+    per = [[k for k in ks if table[k][m] >= min_window] for m in range(nm)]
+    common = [k for k in ks if all(table[k][m] >= min_window for m in range(nm))]
+    circular = period is not None and ks[-1] - ks[0] >= period
+    seq = [k for k in ks if not (circular and k - ks[0] >= period)]     # one period, no repeat
+    order = seq + seq if circular else seq
+    best, cur = [], []
+    for k in order:
+        if k in common:
+            cur.append(k)
+            if len(cur) > len(best) and len(cur) <= len(seq):
+                best = list(cur)
+        else:
+            cur = []
+    pick = best[len(best) // 2] if best else None
+    return per, common, pick, best
+
+
+# ------------------------------------------------------------------------------ write clock groups
+# WL7DDRPHY images (tools/litedram/wl7ddrphy.py, docs/litedram.md section 8): each channel's write
+# side (DQ, DQS) in two clock groups on one MMCM; the fine phase shift moves both, group 1 sits at
+# a static offset from group 0 that the host sets over the MMCM's DRP.
+DRP_CLKOUT = {0: (0x08, 0x09), 1: (0x0A, 0x0B), 2: (0x0C, 0x0D), 3: (0x0E, 0x0F),
+              4: (0x10, 0x11), 5: (0x06, 0x07), 6: (0x12, 0x13)}     # ClkReg1, ClkReg2 (XAPP888)
+
+
+class WriteClocks:
+    """A channel's write clock MMCM (ld_test.WriteClocks, CSRs wclk_*): CLKOUT3 / 4 are group 0's
+    DQ / DQS clocks, CLKOUT5 / 6 group 1's. Static phases in 1/8 VCO periods (7 fine steps, 22.5
+    deg of the DDR clock): PHASE_MUX (ClkReg1 bits 15:13) and DELAY_TIME (ClkReg2 bits 5:0). A
+    write holds the MMCM in reset: the PHY's clocks stop and the fine phase returns to 0, so the
+    DRAM needs its reset and init again."""
+    FINE_PER_EIGHTH = 7
+    EIGHTHS = 16                 # one tCK (the DDR clock is the VCO / 2)
+
+    def __init__(self, csr):
+        self.c = csr
+
+    def _wait(self, name, timeout=1.0):
+        t0 = time.time()
+        while not self.c.r(name):
+            if time.time() - t0 > timeout:
+                raise TimeoutError(f"{name} still 0 after {timeout} s")
+
+    def drp_read(self, adr):
+        self.c.w("wclk_drp_adr", adr)
+        self.c.w("wclk_drp_read", 1)
+        self._wait("wclk_drp_drdy")
+        return self.c.r("wclk_drp_dat_r")
+
+    def drp_write(self, adr, v):
+        self.c.w("wclk_drp_adr", adr)
+        self.c.w("wclk_drp_dat_w", v)
+        self.c.w("wclk_drp_write", 1)
+        self._wait("wclk_drp_drdy")
+
+    def phase(self, out):
+        """CLKOUT<out>'s static phase, 1/8 VCO periods."""
+        r1, r2 = (self.drp_read(a) for a in DRP_CLKOUT[out])
+        return (r2 & 0x3F) * 8 + (r1 >> 13)
+
+    def check(self):
+        """The register reading on the configured MMCM: group 0's DQS is 90 deg (4) after its
+        DQ, group 1's likewise; raises if the encoding is not as assumed."""
+        p = {o: self.phase(o) for o in (3, 4, 5, 6)}
+        if p[4] - p[3] != 4 or p[6] - p[5] != 4:
+            raise CalError(f"write clock MMCM phases {p} (1/8 VCO): DQS not 4 after DQ")
+        return p
+
+    def group1(self):
+        """Group 1's offset from group 0, 1/8 VCO periods."""
+        return (self.phase(5) - self.phase(3)) % self.EIGHTHS
+
+    def set_group1(self, eighths):
+        eighths %= self.EIGHTHS
+        base = self.phase(3)
+        self.c.w("wclk_mmcm_reset", 1)
+        try:
+            for out, e in ((5, base + eighths), (6, base + eighths + 4)):
+                a1, a2 = DRP_CLKOUT[out]
+                r1, r2 = self.drp_read(a1), self.drp_read(a2)
+                self.drp_write(a1, (r1 & 0x1FFF) | ((e % 8) << 13))
+                self.drp_write(a2, (r2 & 0xFFC0) | (e // 8))
+        finally:
+            self.c.w("wclk_mmcm_reset", 0)
+        self._wait("wclk_mmcm_locked")
+
+
+def group_windows(table, groups, period):
+    """margins() per write clock group, over its lanes: {group: (per, common, pick, run)}."""
+    out = {}
+    for g in sorted(set(groups)):
+        lanes = [m for m, x in enumerate(groups) if x == g]
+        sub = {k: [row[m] for m in lanes] for k, row in table.items()}
+        out[g] = margins(sub, len(lanes), period=period)
+    return out
+
+
+def calibrate_groups(d, dqs, wclk, groups, period, stride=1, csr=None, mib=64, log=print):
+    """A WL7DDRPHY channel's write phase: group 1's offset at 0 (on group 0), a scan of the common
+    CK phase over a tCK (per step: calibration and, with `csr`, a BIST per lane), and the phase at
+    the centre of the longest run common to all lanes; calibration there. Each group's own run is
+    logged. Group 1 is not moved: its DRP offset moves only its serializers' CLK against their
+    CLKDIV, and ldtest3 lost every group 1 lane at every offset tried (1/8 to 7/8 VCO either way,
+    both channels). Returns a dict with the scan's table, each group's run (steps), the offset (0)
+    and the common run."""
+    wclk.check()                            # the DRP encoding as assumed, before any write
+    wclk.set_group1(0)
+    d.ctl(0)                                # the DRAM's reset: its clocks stopped
+    time.sleep(0.001)
+    t0 = dqs_scan(d, dqs, period, stride, csr=csr, show=False)
+    gw = group_windows(t0, groups, period)
+    for g, (_, _, pick, run) in gw.items():
+        log(f"  group {g} (lanes {[m for m, x in enumerate(groups) if x == g]}): "
+            + (f"{len(run) * stride} steps ({len(run) * stride * dqs.step_ps:.0f} ps) around +{pick}"
+               if pick is not None else "no common phase"))
+    per, common, pick, run = margins(t0, d.nm, period=period)
+    log(f"  all lanes: {len(run) * stride} steps ({len(run) * stride * dqs.step_ps:.0f} ps)"
+        + (f" around +{pick}" if pick is not None else ""))
+    if pick is None:
+        err = CalError("no CK phase common to every lane")
+        err.scan = t0                       # for the caller's pass map
+        raise err
+    dqs.move(dqs.steps() + pick)
+    runs = {g: len(r) * stride for g, (_, _, _, r) in gw.items()}
+    return {"scan0": t0, "scan1": t0, "offset_eighths": 0, "pick": pick, "run": run,
+            "group_runs": runs, "group_runs_at_offset": runs}
+
+
+# ------------------------------------------------------------------------------ BIST
+def bist(csr, beats, mode, seed, sys_hz, timeout=60.0):
+    bist_start(csr, beats, mode, seed)
+    return bist_wait(csr, beats, mode, sys_hz, timeout)
+
+
+def bist_start(csr, beats, mode, seed):
+    csr.w("bist_base", 0)
+    csr.w("bist_length", beats)
+    csr.w("bist_mode", mode)
+    csr.w("bist_seed", seed)
+    csr.w("bist_start", 1)
+
+
+def bist_wait(csr, beats, mode, sys_hz, timeout=60.0):
+    t0 = time.time()
+    while not csr.r("bist_done"):
+        if time.time() - t0 > timeout:
+            raise TimeoutError(f"BIST mode {mode} not done after {timeout} s "
+                               f"({csr.r('bist_beats')} of {beats} beats)")
+        time.sleep(0.005)
+    ticks = csr.r("bist_ticks")
+    r = {"beats": csr.r("bist_beats"), "ticks": ticks,
+         "gbs": beats * 64 / (ticks / sys_hz) / 1e9 if ticks else 0.0}
+    if mode & 1:
+        r["errors"] = csr.r("bist_errors")
+        r["lanes"] = [csr.r(f"bist_lane{m}_errors") for m in range(9)]
+        r["bits"] = csr.r("bist_lane_bits")
+    return r
+
+
+def run_bist(csr, sys_hz, gib, passes=2):
+    beats = int(gib * (1 << 30)) // 64
+    peak = sys_hz * 64 / 1e9          # one 64-byte beat (8 DQ beats x 64 data bits) per sys cycle
+    ok = True
+    for p in range(passes):
+        for dmode, name in ((0, "random data"), (2, "address data")):
+            seed = (0x0123456789ABCDEF ^ (p * 0x9E3779B97F4A7C15)) & ((1 << 64) - 1)
+            w = bist(csr, beats, dmode, seed, sys_hz)
+            r = bist(csr, beats, dmode | 1, seed, sys_hz)
+            print(f"  pass {p} {name}: write {w['gbs']:.2f} GB/s ({w['gbs'] / peak:.1%}), "
+                  f"read {r['gbs']:.2f} GB/s ({r['gbs'] / peak:.1%}), "
+                  f"errors {r['errors']} (per lane {r['lanes']}, bits {r['bits']:#x})")
+            ok &= r["errors"] == 0 and r["beats"] == beats
+    return ok
+
+
+def bist_read_scan(csr, dram, sys_hz, mib=256, seed=0x0123456789ABCDEF, mode=0):
+    """Read windows under traffic: write a region once (BIST), then for every read tap (all
+    lanes at the same tap, each lane at its calibrated bitslip) read it back with the BIST and
+    count each lane's wrong beats. Returns err[tap][lane]; leaves every lane at the centre of
+    its passing run under traffic (or its calibrated tap if none)."""
+    beats = mib * (1 << 20) // 64
+    bist(csr, beats, mode, seed, sys_hz)
+    table = []
+    dram.strobe("ddrphy_rdly_dq_rst", dram.all)
+    for tap in range(dram.phy["delays"]):
+        r = bist(csr, beats, mode | 1, seed, sys_hz)
+        table.append(r["lanes"])
+        dram.strobe("ddrphy_rdly_dq_inc", dram.all)
+    for m in range(dram.nm):
+        line = "".join("1" if row[m] == 0 else ("0" if row[m] > beats // 100 else "x") for row in table)
+        start, n = Dram.windows([row[m] for row in table])
+        print(f"  m{m}: b{dram.rb[m]} |{line}| {n} taps under traffic"
+              + (f" (DFI window centre {dram.rd[m]}, traffic centre {start + n // 2})" if n else ""))
+        dram.set_rdelay(m, start + n // 2 if n else dram.rd[m])
+    return table
+
+
+def pass_map(table, nm, period, min_window=MIN_WINDOW):
+    """Per lane, the scan as one character per step from -period/2 to +period/2 around the
+    scan's start (the phase the channel runs at): '#' = writes and reads right, '.' = not, ' ' =
+    not scanned."""
+    ks = range(-(period // 2), period // 2 + 1)
+    return ["".join(" " if k % period not in table else "#" if table[k % period][m] >= min_window
+                    else "." for k in ks) for m in range(nm)]
+
+
+def offsets(run, period):
+    """The common window `run` (scan steps from the start, possibly around the tCK) as signed
+    offsets from the start: (lo, hi), or None when the start is not in it."""
+    signed = sorted(k if k <= period // 2 else k - period for k in run)
+    if 0 not in signed and period not in run:
+        return None
+    return signed[0], signed[-1]
+
+
+# ------------------------------------------------------------------------------ simulated PHY
+class FakeCsr:
+    """A PHY model for `selftest`: lane m reads back right only at its read bitslip RB[m], taps
+    in [LO[m], HI[m]], and its write bitslip WB[m] (+-0 tCK), when the DQS phase step is within
+    its write range. With `groups` (a WL7DDRPHY channel), a group 1 lane's step is the DQS
+    step plus group 1's offset (7 steps per 1/8 VCO in the modelled DRP registers). BOFF[m, i]:
+    DQ bit i of lane m reads right at RB[m] + BOFF instead (its ISERDES framed a CLK off); its
+    read bitslip is its own when the CSR map has ddrphy_dly_sel_bits."""
+    def __init__(self, build, nm=9, seed=1, groups=None, ps_moves_ck=False):
+        self.regs = csr_map(Path(build) / "csr.csv")
+        rnd = random.Random(seed)
+        self.nm = nm
+        self.RB = [rnd.randrange(8) for _ in range(nm)]
+        self.WB = [rnd.choice((0, 2, 4)) for _ in range(nm)]
+        self.LO = [rnd.randrange(0, 18) for _ in range(nm)]
+        self.HI = [lo + rnd.randrange(4, 12) for lo in self.LO]
+        self.WLO = [rnd.randrange(10, 30) for _ in range(nm)]
+        self.WHI = [lo + rnd.randrange(40, 70) for lo in self.WLO]
+        self.v = {}
+        self.sel, self.wb, self.rd = 0, [0] * nm, [0] * nm
+        self.rbb = [[0] * 8 for _ in range(nm)]     # read bitslip per DQ bit
+        self.BOFF = {}
+        self.wr = {}
+        self.steps = 0
+        self.groups = groups or [0] * nm
+        self.ck = ps_moves_ck               # the phase shift moves CK, not DQ / DQS
+        # write clock MMCM registers as configured: CLKOUT3 / 5 at 0, CLKOUT4 / 6 at 90 deg
+        self.drp = {0x0E: 0x0041, 0x0F: 0, 0x10: 0x8041, 0x11: 0,
+                    0x06: 0x0041, 0x07: 0, 0x12: 0x8041, 0x13: 0}
+
+    def step_of(self, m):
+        if not self.groups[m]:
+            return self.steps
+        ph = lambda a1, a2: (self.drp[a2] & 0x3F) * 8 + (self.drp[a1] >> 13)
+        off = 7 * (ph(0x06, 0x07) - ph(0x0E, 0x0F))
+        return self.steps - off if self.ck else self.steps + off
+
+    @property
+    def rb(self):
+        return [r[0] for r in self.rbb]
+
+    def bit_ok(self, m, i):
+        return (self.rbb[m][i] == (self.RB[m] + self.BOFF.get((m, i), 0)) % 8
+                and self.LO[m] <= self.rd[m] <= self.HI[m] and self.wb[m] == self.WB[m]
+                and self.WLO[m] <= self.step_of(m) % 112 <= self.WHI[m])
+
+    def w(self, name, v):
+        self.v[name] = v
+        lanes = [m for m in range(self.nm) if self.sel >> m & 1]
+        bits = [i for i in range(8) if self.v.get("ddrphy_dly_sel_bits", 0xFF) >> i & 1]
+        whole = len(bits) == 8
+        if name == "ddrphy_dly_sel":
+            self.sel = v
+        elif name == "ddrphy_rdly_dq_rst":
+            for m in lanes: self.rd[m] = 0
+        elif name == "ddrphy_rdly_dq_inc":
+            for m in lanes: self.rd[m] = (self.rd[m] + 1) % 32
+        elif name == "ddrphy_rdly_dq_bitslip_rst":
+            for m in lanes:
+                for i in bits: self.rbb[m][i] = 0
+        elif name == "ddrphy_rdly_dq_bitslip":
+            for m in lanes:
+                for i in bits: self.rbb[m][i] = (self.rbb[m][i] + 1) % 8
+        elif name == "ddrphy_wdly_dq_bitslip_rst" and whole:
+            for m in lanes: self.wb[m] = 0
+        elif name == "ddrphy_wdly_dq_bitslip" and whole:
+            for m in lanes: self.wb[m] = (self.wb[m] + 1) % 8
+        elif name == "phase_dqs_shift":
+            self.steps += 1 if v else -1
+        elif name == "wclk_mmcm_reset":
+            if not v:
+                self.steps = 0              # the fine phase restarts from the static phases
+        elif name == "wclk_drp_write":
+            self.drp[self.v["wclk_drp_adr"]] = self.v["wclk_drp_dat_w"]
+        elif name == "wclk_drp_read":
+            self.v["wclk_drp_dat_r"] = self.drp.get(self.v["wclk_drp_adr"], 0)
+        elif name.endswith("_command_issue") and self.v.get(name[:-6]) and name.startswith("sdram_dfii_pi"):
+            c = self.v[name[:-6]]
+            if c & Dram.WRDATA:
+                self.wr = {p: self.v.get(f"sdram_dfii_pi{p}_wrdata", 0) for p in range(4)}
+            if c & Dram.RDDATA:
+                for p in range(4):
+                    x = self.wr.get(p, 0)
+                    for m in range(self.nm):
+                        for i in range(8):
+                            if not self.bit_ok(m, i):
+                                x ^= (1 << (8 * m + i)) | (1 << (72 + 8 * m + i))
+                    self.v[f"sdram_dfii_pi{p}_rddata"] = x
+
+    def good(self, m):
+        return all(self.bit_ok(m, i) for i in range(8))
+
+    def r(self, name):
+        if name == "phase_dqs_steps":
+            return self.steps & 0xFFFFFFFF
+        if name in ("phase_dqs_busy", "ctrl_bus_errors"):
+            return 0
+        if name in ("wclk_drp_drdy", "wclk_mmcm_locked"):
+            return 1
+        n = self.v.get("bist_length", 0)
+        bad = [0 if self.good(m) else n for m in range(self.nm)] if self.v.get("bist_mode", 0) & 1 \
+            else [0] * self.nm
+        if name == "bist_done":
+            return 1
+        if name in ("bist_beats", "bist_ticks"):
+            return n
+        if name == "bist_errors":
+            return max(bad)
+        if name.startswith("bist_lane") and name.endswith("_errors"):
+            return bad[int(name[len("bist_lane"):-len("_errors")])]
+        if name == "xadc_temperature":
+            return round((45 + 273.15) * 4096 / 503.975)
+        if name == "i2c_in":
+            return 0x1F                 # every line released (high): no device answers
+        return self.v.get(name, 0)
+
+
+class FakeBoard:
+    """Two FakeCsr channels behind one CSR space: channel 1's names (ddrphy1_*, ...) go to the
+    second, with its own lanes (and, for a WL7DDRPHY image, its write clock groups)."""
+    def __init__(self, build):
+        ns = {}
+        exec(Path(load_config(build)).read_text(), ns)
+        groups, ck = ns["phy"].get("groups", {}), ns["phy"].get("ps_moves") == "ck"
+        self.ch = [FakeCsr(build, groups=groups.get("0"), ps_moves_ck=ck),
+                   FakeCsr(build, seed=2, groups=groups.get("1"), ps_moves_ck=ck)]
+        self.regs = self.ch[0].regs
+
+    def route(self, name):
+        p, _, rest = name.partition("_")
+        if p.endswith("1") and p[:-1] in PREFIXES:
+            return self.ch[1], f"{p[:-1]}_{rest}"
+        return self.ch[0], name
+
+    def w(self, name, v):
+        f, n = self.route(name)
+        f.w(n, v)
+
+    def r(self, name):
+        f, n = self.route(name)
+        return f.r(n)
+
+
+# ------------------------------------------------------------------------------ configuration
+def load_config(build):
+    """The PHY settings and init sequence of a LiteDRAM build: its sdram_init.py (ld_test.py
+    writes it into the build directory)."""
+    p = Path(build)
+    return p / "sdram_init.py" if p.is_dir() else p
+
+
+def csr_map(path):
+    """LiteX csr.csv -> {name: (byte offset, 32-bit words)}."""
+    regs = {}
+    for row in csv.reader(open(path)):
+        if row and row[0] == "csr_register":
+            regs[row[1]] = (int(row[2], 16), int(row[3]))
+    return regs
+
+
+class WordCsr:
+    """w / r on CSR names over a 32-bit word transport (read32(offset), write32(offset, v)), a
+    window at `base`; multi-word CSRs most significant word first (csr_data_width 32)."""
+    def __init__(self, regs, read32, write32, base=0):
+        self.regs, self.rd, self.wr, self.base = regs, read32, write32, base
+
+    def w(self, name, v):
+        a, n = self.regs[name]
+        for i in range(n):
+            self.wr(self.base + a + 4 * i, (v >> (32 * (n - 1 - i))) & 0xFFFFFFFF)
+
+    def r(self, name):
+        a, n = self.regs[name]
+        v = 0
+        for i in range(n):
+            v = (v << 32) | self.rd(self.base + a + 4 * i)
+        return v
+
+
+# ------------------------------------------------------------------------------ the whole flow
+class CalError(RuntimeError):
+    pass
+
+
+def calibrate_channel(csr, config, stride=1, mib=64, log=print):
+    """One channel from reset to the controller: the DQS phase scan (a BIST traffic test per
+    phase when the channel has one, else the DFII check only), the phase at the centre of the
+    window common to all lanes, write latency and read leveling there, then the controller
+    takes the PHY and (production's core, tools/litedram/gen_core.py) cal_ready goes to 1; it
+    is 0 from the start. The scan writes over the channel's first `mib` MiB. Returns the
+    result; raises CalError when no phase or calibration works."""
+    d = Dram(csr, config)
+    dqs = dqs_phase(csr, d.phy)
+    period = round(56 * d.phy["vco_hz"] / (4 * d.phy["sys_hz"]))     # fine steps per tCK
+    has_bist = has_csr(csr, "bist_start")
+    has_ready = has_csr(csr, "cal_ready")          # production's core: the accelerator waits for it
+    if has_ready:
+        csr.w("cal_ready", 0)
+    groups = d.phy.get("groups", {}).get(str(getattr(csr, "ch", 0)))
+    extra = {}
+    if d.phy.get("phy") == "wl" and groups:     # WL7DDRPHY: group 1's offset, then the phase
+        g = calibrate_groups(d, dqs, WriteClocks(csr), groups, period, stride=stride,
+                             csr=csr if has_bist else None, mib=mib, log=log)
+        table, run = g["scan1"], g["run"]
+        extra = {"group1_eighths": g["offset_eighths"], "group_runs_steps": g["group_runs"]}
+    else:
+        table = dqs_scan(d, dqs, period, stride, csr=csr if has_bist else None, mib=mib, show=False)
+        per, common, pick, run = margins(table, d.nm, period=period)
+        if pick is None:
+            raise CalError("no DQS phase works for every lane")
+        dqs.move(dqs.steps() + pick)
+    wl, rl, err = d.calibrate(verbose=False)
+    if any(err) or min(wl) < 0:
+        raise CalError(f"calibration at DQS step {dqs.steps()} failed: write latency {wl}, "
+                       f"errors per lane {err}")
+    d.hardware()
+    if has_ready:
+        csr.w("cal_ready", 1)
+    res = {"dqs_steps": dqs.steps(), "window_steps": len(run) * stride,
+           "window_ps": round(len(run) * stride * dqs.step_ps), "traffic_checked": has_bist,
+           "write_latency": wl, "read": [{"taps": n, "bitslip": b, "tap": s + n // 2}
+                                         for n, b, s in rl],
+           "bit_offsets": [list(o) for o in d.boff], "lanes": pass_map(table, d.nm, period), **extra}
+    log(f"DQS step {res['dqs_steps']}, common write window {res['window_ps']} ps"
+        f"{'' if has_bist else ' (DFII check only: no BIST)'}, write latency {wl}, read windows "
+        f"{[n for n, _, _ in rl]} taps")
+    return res
+
+
+def has_csr(csr, name):
+    regs = getattr(csr, "regs", None) or getattr(getattr(csr, "csr", None), "regs", {})
+    return (csr.name(name) if isinstance(csr, Chan) else name) in regs

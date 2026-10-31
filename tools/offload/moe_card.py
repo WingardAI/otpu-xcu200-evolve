@@ -1,0 +1,672 @@
+"""A MoE model (LFM2.5-8B-A1B, Qwen3.5-35B-A3B) end to end on the ISA simulator with the card's
+4 GiB of DRAM (docs/offload.md, phase 2): the card routes and computes every expert, its
+experts stream into per-layer slots through the host's server (opentpu.host.offload), and the
+decode loop runs on the card (autodecode's generate program). Greedy tokens against Hugging
+Face's.
+
+    python3 tools/offload/moe_card.py MODEL --hf out.json       # HF's greedy tokens (bf16, CPU)
+    python3 tools/offload/moe_card.py MODEL --check out.json    # the simulator's, compared
+    python3 tools/offload/moe_card.py MODEL --check out.json --cfg dev.pkl --card   # the card's
+
+The HF run and the simulator run are separate processes: each needs most of a 32 GB host.
+--cfg takes the bitstream's configuration (tools/qual/refs.py cfg): the simulator's run with it
+is the card's reference bit for bit (its prefill logits' sha256 and its tokens); --card runs on
+the card (/dev/xdma0) with the host's server polled while each run is in flight, and adds the
+device's cycles, the tok/s and where the host's time went (pool reads, DRAM writes over PCIe).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import time
+from pathlib import Path
+
+import numpy as np
+
+from opentpu.host import streamed as ST
+
+PROMPT = "What is the capital of France? Answer in one sentence."
+IDLE_PARTS = ST.IDLE_PARTS                  # --idle-parts (docs/offload.md 13.12)
+
+
+def hf_greedy(model: str, n: int, max_memory: str | None, prompt: str = PROMPT) -> dict:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(model)
+    if tok.chat_template is not None:
+        ids = tok.apply_chat_template([{"role": "user", "content": prompt}],
+                                      add_generation_prompt=True, tokenize=True)
+        ids = list(ids["input_ids"] if hasattr(ids, "keys") else ids)
+    else:                                       # a checkpoint without one (the 26B's download):
+        ids = list(tok(prompt)["input_ids"])    # the prompt as plain text, after BOS
+    kw = {}
+    if max_memory:                              # the rest offloaded to disk (accelerate)
+        kw = dict(device_map="auto", max_memory={"cpu": max_memory},
+                  offload_folder=str(Path(model) / ".." / ".offload-moe-card"))
+    m = AutoModelForCausalLM.from_pretrained(model, dtype=torch.bfloat16, **kw).eval()
+    t = time.time()
+    with torch.no_grad():
+        out = m.generate(torch.tensor([ids]), max_new_tokens=n, min_new_tokens=n,
+                         do_sample=False, output_scores=True, return_dict_in_generate=True)
+    new = [int(x) for x in out.sequences[0, len(ids):]]  # n tokens: past an end of turn too
+    top = []                                    # per step HF's 8 best (id, logit): a card's
+    for sc in out.scores:                       # different pick, by how much it lost
+        v, i = torch.topk(sc[0].float(), 8)
+        top.append([[int(a), round(float(b), 4)] for a, b in zip(i, v)])
+    return dict(model=model, prompt=prompt, ids=ids, tokens=new, text=tok.decode(new),
+                top=top, seconds=round(time.time() - t, 1))
+
+
+def ahead_order(value: str, spec):
+    """--layer-ahead's order: "index" (True: each layer's experts in index order), "hint" (the
+    card's own guess: each layer run's hint for the next layer, docs/offload.md 13.9), or router
+    traces (router_trace.py's or --trace's, comma-separated): per MoE layer its experts by use
+    in them, most used first (a static profile; no model math on the host)."""
+    if value in ("index", "hint"):
+        return True if value == "index" else value
+    E, nl = spec.moe.E, spec.layers - spec.moe.first
+    cnt = np.zeros((nl, E))
+    for path in value.split(","):
+        z = np.load(path)
+        moe = sorted(int(k[1:-4]) for k in z.files if k.startswith("L") and k.endswith("_idx"))
+        if len(moe) != nl:
+            raise ValueError(f"{path}: {len(moe)} MoE layers, the model has {nl}")
+        for j, li in enumerate(moe):
+            cnt[j] += np.bincount(z[f"L{li}_idx"].astype(np.int64).ravel(), minlength=E)[:E]
+    return [np.argsort(-c, kind="stable").tolist() for c in cnt]
+
+
+def dump_axi_error(t) -> None:
+    """The kernel's post-mortem of an AXI_ERR (otpu_u200_core_kernel: regs 0x028..0x02F): each
+    channel's cause (2 RLAST, 3 RRESP, 4 BRESP), the last AR/AW address the first failing
+    channel issued, its channel and the cycle. A read of a beat that was never written since
+    power-up is RRESP 3 (uncorrectable ECC) -- which is what a pool page the fill did not reach
+    looks like."""
+    if t is None:
+        return
+    try:
+        w = [t.reg_read(0x028 + 4 * k) for k in range(8)]
+    except Exception as e:                              # noqa: BLE001
+        print(f"axi-error dump failed: {e}", flush=True)
+        return
+    cause = {0: "none", 1: "?", 2: "RLAST", 3: "RRESP", 4: "BRESP"}
+    per = [f"ch{c} {'ERR' if (w[0] >> (4 * c)) & 1 else 'ok'}"
+           f"/{cause.get((w[0] >> (4 * c + 1)) & 7, '?')}" for c in range(4)]
+    print(f"  AXI_ERR: {' '.join(per)}; mem_ch sticky {(w[0] >> 16) & 0xF:#x}; "
+          f"first channel {w[3] & 0x7 if w[3] & 0x8 else '-'} "
+          f"AR {w[1]:#010x} AW {w[2]:#010x} at cycle {w[4] / 180e6:.6f} s", flush=True)
+
+
+def _slots(s: str):
+    """--experts: an int, or a list like 256,8x39 (the first layer 256, then 39 of 8)."""
+    if s.isdigit():
+        return int(s)
+    out = []
+    for part in s.split(","):
+        k, _, m = part.partition("x")
+        out += [int(k)] * (int(m) if m else 1)
+    return out
+
+
+def card(model: str, ref: dict, n: int, experts, cap: int, pool: str | None,
+         host_loop: bool = False, embed: str | None = None, trace: str | None = None,
+         cfg_file: str | None = None, on_card: bool = False, policy: str = "lfu",
+         embed_host: bool | None = None, hints: bool | None = None,
+         hint_part: int | None = None, hint_drop: bool = False, hint_n: int = 0,
+         hint_top: int = 0,
+         hint_trace: str | None = None, wformat: str = "fp4", head_format: str = "int8",
+         formats: str | None = None, layer_major: int = 0, pooled: bool = True,
+         release_weights: bool = True, willneed: bool = True, pool_map: bool = True,
+         legacy_serve: bool = False, embed_runs: bool = False,
+         poll_idle: str | None = None, prefill_trace: str | None = None,
+         layer_ahead: str | None = None, ahead_part: int | None = None,
+         idle_parts: str = "v2", expert_major: bool | None = None) -> dict:
+    import hashlib
+    import pickle
+    from opentpu.isasim import board_config
+    from opentpu.llm import load_spec
+    if formats is not None:                     # per-kind formats (Gemma 4: "experts=fp4"
+        os.environ["OTPU_FORMATS"] = formats    # beside int8 layers; opentpu/llm/formats.py)
+    cfg = pickle.loads(Path(cfg_file).read_bytes()) if cfg_file else board_config()
+    backend = "isa"
+    if on_card:
+        # The transport follows OTPU_XCLBIN like every other tool: XRT (an xclbin, the U200) when
+        # it is set, else the K7's XDMA device. Both give BoardBackend the same Board API, so the
+        # expert server's writes and the runs are unchanged.
+        from opentpu.host.board import BoardBackend, default_transport
+        tr = default_transport()
+        print(f"card: {type(tr).__name__}"
+              + (f", {len(getattr(tr, 'bo', []))} BOs" if getattr(tr, "bo", None) else ""),
+              flush=True)
+        backend = lambda c, imgs: BoardBackend(c, imgs, transport=tr,      # noqa: E731
+                                               model=Path(model).name)
+    if on_card and os.environ.get("OTPU_RESIDENT") and pool is not None:
+        # The resident pool is allocated and filled **before** the image is built: with the pool's
+        # 18 GiB of host-shadowed BOs, doing it after the build makes the kernel evict the build's
+        # page cache in one long burst, which a desktop's systemd-oomd kills the session over
+        # (docs/u200.md).
+        from opentpu.llm import moe as MO
+        from opentpu.llm import load_spec as _spec
+
+        def say(msg: str) -> None:
+            print(f"  {msg}", flush=True)
+
+        say("resident pool: allocating and filling before the image")
+        MO.preallocate(tr, _spec(model), cfg, wformat, pool_file=pool, log=say)
+    t = time.time()
+    # the engine, the pool and the server as otpu-chat's (opentpu/host/streamed.py): the
+    # prompt layer by layer only with --layer-major (docs/offload.md 13), each expert packed
+    # into the pool on its first use (create)
+    eng = ST.engine(model, cfg, backend, cap, pool, experts=experts, policy=policy,
+                    wformat=wformat, head_format=head_format, embed=embed,
+                    embed_host=embed_host, hints=hints, layer_major=layer_major,
+                    pooled=pooled, embed_runs=embed_runs,     # (13.6: port A's fix)
+                    layer_ahead=ahead_order(layer_ahead, load_spec(model))     # (13.7)
+                    if layer_major and layer_ahead else None,
+                    expert_major=expert_major, ahead_part=ahead_part,      # (13.11, 13.13)
+                    idle_parts=idle_parts, willneed=willneed, pool_map=pool_map,
+                    release_weights=release_weights, create=True)  # (10.6, 10.7)
+    load_s = time.time() - t
+    spec, srv = eng.spec, eng.server
+    rp = getattr(srv, "resident", None)
+    if rp is not None and not hasattr(rp, "pages"):    # (the simulator's pool: a copy a layer)
+        print(f"resident pool: the simulator's DRAM, {rp.L.layers} layers of "
+              f"{rp.L.layer_bytes / 2**20:.1f} MiB at {rp.L.slots[0][0]:#x}", flush=True)
+        rp = None
+    elif rp is not None:                        # (the fill happened inside the engine's build)
+        print(f"resident pool: {rp.pages} BOs a channel "
+              f"{[f'{b / (1 << 30):.0f}G' for b in rp.sizes]} = {rp.bytes / (1 << 30):.1f} GiB, "
+              f"{rp.used / rp.bytes:.1%} holding experts; layer 0's window "
+              f"{rp.window(0, 0):#x}, layer {rp.L.layers - 1}'s {rp.window(0, rp.L.layers - 1):#x}",
+              flush=True)
+        srv.pool_warm = None                    # (nothing streams: the warm read is pointless)
+    expert_major = eng.expert_major             # (None: streamed.engine's default, 13.15)
+    experts = eng.image.offload.slots[0][1]     # (slots per layer: 0 filled the DRAM)
+    srv.history, per_req = [], []               # each request's ids and misses
+    serve, pool_of, mem = srv.serve, srv.pool, srv.mem
+    tm = dict(serve=0.0, pool=0.0, write=0.0, read=0.0, stage=0.0, flush=0.0,   # host's s
+              poll=0.0, hint=0.0, ahead=0.0)
+
+    calls = dict.fromkeys(tm, 0)                # and how many calls
+
+    def timed(part, f):
+        def g(*a, **kw):
+            t0 = time.perf_counter()
+            try:
+                return f(*a, **kw)
+            finally:
+                tm[part] += time.perf_counter() - t0
+                calls[part] += 1
+        return g
+
+    def counted(ids_, *pos):
+        m0 = srv.misses
+        timed("serve", serve)(ids_, *pos)
+        per_req.append(srv.misses - m0)
+    srv.serve = counted
+    srv.step = timed("hint", srv.step)          # a hinted expert's part on idle time (polls')
+    if hint_part:                               # the hints' handling (ExpertServer)
+        srv.part = hint_part
+    srv.drop = hint_drop
+    srv.hint_n, srv.hint_top = hint_n, hint_top
+    srv.pool = timed("pool", pool_of)
+    mem.write, mem.read = timed("write", mem.write), timed("read", mem.read)
+    if hasattr(mem, "write_slot"):              # BoardDram: staging (the main thread), and
+        mem.write_slot = timed("stage", mem.write_slot)     # waiting for the DMA thread
+        if hasattr(mem, "stage"):               # the idle parts' read-ahead (beside a DMA)
+            mem.stage = timed("ahead", mem.stage)
+        mem.flush = timed("flush", mem.flush)
+    if callable(getattr(eng.backend, "host", None)):
+        polled = [eng.backend.host]             # (the decode's may be a PollPacer's)
+
+        def served():                           # the polls that served a request: the card
+            t0 = time.perf_counter()            # waits from its post to served (with the
+            r = polled[0]()                     # poll's own latency)
+            if r:
+                tm["poll"] += time.perf_counter() - t0
+            return r
+        eng.backend.host = served
+    warm, pf = getattr(srv, "pool_warm", None), getattr(srv, "pool_file", None)
+    if legacy_serve:                            # the serving of docs/offload.md 10.7 (A/B, 10.8):
+        from opentpu.host import board as brd   # halves, buffer lists, the victims' entries
+        mem.lead, srv.clear_late = None, False  # first, a 50 us sleep between polls, out[] read
+        if pf is not None:                      # every poll
+            pf.iov = False
+        t_ = getattr(getattr(eng.backend, "board", None), "t", None)
+        if t_ is not None:
+            t_.host_idle = brd.HOST_IDLE
+        brd.HOST_TAKE = 0.0
+
+    def warm_at():                              # the pool file's packed experts: read by the
+        if warm is None:                        # warm thread, and in the page cache
+            return None
+        r = pf.resident(pf.ids)
+        return dict(read_gb=round(warm.bytes / 1e9, 2), done=not warm.is_alive(),
+                    resident_gb=None if r is None else round(r / 1e9, 2))
+    warm_load = warm_at()
+    board = getattr(eng.backend, "board", None)     # the card's free-running counters
+    snap = getattr(board, "snapshot", None)
+    b, runs, cur = eng.backend, [], [None]      # the prompt's runs: the layer run's key (None:
+    card_ = hasattr(b, "start")                 # a token step), started, done, halted, counters
+    undo = [(o, k, vars(o).get(k)) for o, k in
+            [(eng, "_layer_run")] + [(b, k) for k in (("start", "wait") if card_ else ("run",))]]
+    lr = eng._layer_run
+
+    def layer_run(key):
+        cur[0] = key
+        return lr(key)
+
+    snap_run = getattr(board, "snapshot", None)     # (the device's counters, a run at a time)
+    ctr = []                                        # [(key, the run's counters, wall s)]
+
+    def begun(f):
+        def g(*a, **k):
+            # (the window is the request's own layer now: serve() sets it and the card fences on
+            # that request's `served` before it reads -- moe_ffn's window fence)
+            runs.append([cur[0], time.perf_counter()])
+            ctr0[0] = snap_run() if snap_run is not None else None
+            return f(*a, **k)
+        return g
+    ctr0 = [None]
+
+    def ended(f):
+        def g(*a, **k):
+            st = f(*a, **k)
+            ic = st.get("instructions")
+            runs[-1] += [time.perf_counter(), getattr(board, "t_seen", None), st.get("cycles"),
+                         sum(ic) if isinstance(ic, list) else ic] + \
+                [st.get(c) for c in ("b_reads", "b_writes", "a_reads", "a_writes", "b_stall")]
+            if ctr0[0] is not None and snap_run is not None:
+                ctr.append((runs[-1][0], {k: v - ctr0[0].get(k, 0) for k, v in snap_run().items()},
+                            runs[-1][2] - runs[-1][1]))
+            cur[0] = None
+            return st
+        return g
+    eng._layer_run = layer_run
+    if card_:                                   # the card (BoardBackend.run: start + wait)
+        b.start, b.wait = begun(b.start), ended(b.wait)
+    else:                                       # the simulator
+        b.run = begun(ended(b.run))
+    srv.events, snap_pre = [], snap() if snap else None
+    if ref is None:                             # a smoke test: the prompt's ids, no reference
+        from transformers import AutoTokenizer
+        _tk = AutoTokenizer.from_pretrained(model)
+        _t = _tk.apply_chat_template([{"role": "user", "content": PROMPT}],
+                                     add_generation_prompt=True, tokenize=True)
+        ref = {"ids": list(_t["input_ids"] if hasattr(_t, "keys") else _t), "tokens": []}
+    ids = ref["ids"]
+    t, t_pre = time.time(), time.perf_counter()
+    from opentpu import waits as WC             # (the wait entries' pass: whose, and how long)
+    wc0 = dict(WC.stats)
+    lg = eng.prefill(ids if host_loop else ids[:-1])
+    t_end = time.perf_counter()
+    waits_prefill = {k: round(v, 3) if k == "seconds" else v
+                     for k, v in ((k, WC.stats[k] - wc0[k]) for k in WC.stats)}
+    if getattr(eng, "em_last", None) is not None:   # (the default's: from EM_ROWS rows, 13.16)
+        expert_major = eng.em_last[1]
+    snap_end, pev, srv.events = snap() if snap else None, srv.events, None
+    for o, k, v in undo:                        # the decode as before
+        if v is None:
+            delattr(o, k)
+        else:
+            setattr(o, k, v)
+    pacer = None
+    if poll_idle == "predict" and callable(getattr(eng.backend, "host", None)):
+        from opentpu.host.offload import PollPacer   # the decode's polls sleep through the
+        pacer = PollPacer([x for x in (srv, eng.row_server) if x is not None])  # gaps (10.10)
+        polled[0] = pacer.poll
+    elif poll_idle not in (None, "spin", "predict"):    # a fixed sleep between empty polls
+        t_ = getattr(getattr(eng.backend, "board", None), "t", None)
+        if t_ is not None:
+            t_.host_idle = float(poll_idle)
+    elif poll_idle == "spin":
+        t_ = getattr(getattr(eng.backend, "board", None), "t", None)
+        if t_ is not None:
+            t_.host_idle = 0.0
+    prefill_s = time.time() - t
+    pre = len(per_req) if layer_major else 0    # layer-major: a request per layer run (none
+                                                # expert-major, but the token steps')
+    khz = (getattr(eng.backend, "info", None) or {}).get("core_khz")
+    done = [r for r in runs if len(r) > 2]
+    run_s = sum(r[2] - r[1] for r in done)      # each run's start .. its wait's return
+    req = [e for e in pev if e[2] == "d"]
+    prefill_time = dict(
+        wall_s=round(t_end - t_pre, 3), runs=len(done),
+        layer_runs=sum(r[0] is not None for r in done), run_s=round(run_s, 3),
+        device_s=round(sum(r[4] or 0 for r in done) / (khz * 1e3), 3) if khz else None,
+        halted_s=round(sum(r[3] - r[1] for r in done), 3) if card_ and board else None,
+        between_s=round(t_end - t_pre - run_s, 3),  # the host's between runs: programs, rows,
+        requests=len(req),                          # slots, the logits' read
+        serve_s=round(sum(e[1] - e[0] for e in req), 3),
+        host={k: round(v, 3) for k, v in tm.items()},   # (all the prompt's: none before)
+        counters={k: v - snap_pre[k] for k, v in snap_end.items()} if snap_end else None,
+        ahead=dict(calls=srv.aheads, landed=srv.landed, dropped=srv.dropped,  # (the layer
+                   promoted=srv.promoted, hints=sum(e[2] == "h" for e in pev),  # ahead's;
+                   queued=getattr(srv, "hinted_ahead", None))   # the hints' ids it queued)
+        if eng.layer_ahead else None,
+        need={k: getattr(srv, k, None) for k in ("need_lines", "needs_queued", "need_hits",
+                                                 "needs_landed", "drained")}
+        if expert_major else None)                  # (expert-major's need lines, 13.11)
+    if prefill_trace:                           # the prompt's timeline (s from its start)
+        z = lambda v: None if v is None else round(v - t_pre, 6)    # noqa: E731
+        Path(prefill_trace).write_text(json.dumps(dict(
+            core_khz=khz, wall_s=t_end - t_pre,
+            run_fields=["key", "start", "done", "halted", "cycles", "instructions", "b_reads",
+                        "b_writes", "a_reads", "a_writes", "b_stall"],
+            runs=[[r[0], z(r[1]), z(r[2]), z(r[3])] + r[4:] for r in done],
+            event_fields=["seen", "done", "kind", "layer or expert", "misses or bytes"],
+            events=[[z(e[0]), z(e[1])] + list(e[2:]) for e in pev],
+            requests=srv.history[:len(per_req)], misses=per_req[:])))
+    warm_decode = warm_at()
+    lg_sha = hashlib.sha256(np.asarray(lg, np.float32).tobytes()).hexdigest()[:16]
+    tm0, b0, st0, calls0 = dict(tm), srv.bytes, len(eng.stats), dict(calls)
+    if hint_trace:                              # the decode's timeline of hints and requests
+        srv.events = []                         # (and BoardDram's DMA calls)
+        if hasattr(mem, "calls"):
+            mem.calls = []
+    dma0 = (getattr(mem, "dma_s", 0.0), getattr(mem, "dma_bytes", 0))
+    direct0 = getattr(mem, "direct", 0)         # experts read from the file into their runs
+    wait0 = getattr(mem, "wait_s", 0.0)         # staging's waits for the DMA thread
+    if pf is not None:                          # the decode's pool reads: page cache or disk
+        pf.io = {}
+    snap0, mem_decode = snap() if snap else None, ST.host_mem()
+    wc0 = dict(WC.stats)                        # (the decode's own entries: the L1 gate)
+    t = time.time()
+    top = []                    # host loop: the device's 8 best (id, logit) per step
+
+    def best(v):
+        i = np.argsort(-v, kind="stable")[:8]
+        top.append([[int(j), round(float(v[j]), 4)] for j in i])
+        return int(i[0])
+    def decode():               # (OTPU_PROFILE_DECODE: only the per-token host work)
+        if host_loop:           # the resident decode programs, the argmax on the host
+            got = [best(lg)]
+            for _ in range(n - 1):
+                got.append(best(eng.step(got[-1])))
+            return got
+        # the prompt's last token fed by the card's loop: every pick on the card
+        return eng.generate_card(ids[-1], n, stop_ids=[])
+
+    if os.environ.get("OTPU_PROFILE_DECODE"):
+        import cProfile
+        import pstats
+        pr = cProfile.Profile()
+        pr.enable()
+        try:
+            got = decode()
+        finally:
+            pr.disable()
+            with open(os.environ.get("OTPU_PROFILE_OUT", "/tmp/otpu-profile-decode.txt"),
+                      "w") as f:
+                st = pstats.Stats(pr, stream=f)
+                st.sort_stats("tottime").print_stats(25)
+                st.sort_stats("cumulative").print_stats(25)
+    else:
+        got = decode()
+    gen_s = time.time() - t
+    waits_decode = {k: round(v, 3) if k == "seconds" else v
+                    for k, v in ((k, WC.stats[k] - wc0[k]) for k in WC.stats)}
+    snap1, mem_end, warm_end = snap() if snap0 else None, ST.host_mem(), warm_at()
+    if ctr:                                     # OTPU_RUN_COUNTERS: what a run spent its cycles on
+        print("  run  kinds      wall_ms   cycles  mxu%  mac%  dma%  vpu% strs% deny%"
+              "  dram_rd   instr", flush=True)
+        for i, (k, c, w) in enumerate(ctr):
+            cyc = c.get("RUNNING", 0) or 1
+            if i and i + 1 != len(ctr) and i > 3 and i < len(ctr) - 3:
+                if i == 4:
+                    print("   ...")
+                continue
+            print(f"  {i:3d}  {str(k)[:10]:10} {w * 1e3:8.2f} {cyc:8d} "
+                  f"{c.get('MXU_BUSY', 0) / cyc:5.2f} {c.get('MXU_MAC', 0) / cyc:5.2f} "
+                  f"{c.get('DMA_BUSY', 0) / cyc:5.2f} {c.get('VPU_BUSY', 0) / cyc:5.2f} "
+                  f"{c.get('MXU_STARVE', 0) / cyc:5.2f} {c.get('TMEM_DENY', 0) / cyc:5.2f} "
+                  f"{c.get('DRAM_RD', 0):9d} {c.get('INSTR', 0):7d}", flush=True)
+    if hint_trace:
+        Path(hint_trace).write_text(json.dumps(srv.events))
+        srv.events = None
+        if getattr(mem, "calls", None) is not None:
+            Path(hint_trace).with_suffix(".calls.json").write_text(json.dumps(mem.calls))
+            mem.calls = None
+    host = {k: round(tm[k] - tm0[k], 3) for k in tm}          # the decode's
+    host.update(bytes=srv.bytes - b0, polls_read_s=host.pop("read"),
+                polls_reads=calls["read"] - calls0["read"])     # (each a card read's DMA)
+    if hasattr(mem, "dma_s"):                   # the DMA thread's own time and rate
+        ds, db = mem.dma_s - dma0[0], mem.dma_bytes - dma0[1]
+        host.update(dma_s=round(ds, 3), dma_gbs=round(db / ds / 1e9, 3) if ds else None,
+                    memory=type(mem).__name__, direct=mem.direct - direct0)
+    if hasattr(mem, "wait_s"):                  # stage = these waits + the pool's reads + copies
+        host.update(stage_wait=round(mem.wait_s - wait0, 3))
+    if pf is not None:
+        host.update(reads={k: [v[0], round(v[1], 3), v[2], v[3]] for k, v in pf.io.items()})
+        pf.io = None
+    cyc = sum(s.get("cycles", 0) for s in eng.stats[st0:])       # (the simulator: none)
+    dev_s = cyc / (khz * 1e3) if khz else None
+    L = eng.image.offload
+    J, E = L.layers, L.E
+    T = (len(per_req) - pre) // J               # whole tokens (the last request may be unread)
+    mpt = np.array(per_req[pre:pre + T * J]).reshape(T, J).sum(1)  # misses per token
+    prompt = (0 if host_loop else 1) if layer_major else len(ids)  # the prompt's tokens among
+    dec = mpt[prompt:]
+    if trace:                                   # the card's routes, as router_trace.py's
+        req = np.array(srv.history[pre:pre + T * J]).reshape(T, J, -1)
+        first = spec.moe.first
+        z = {f"L{first + j}_idx": (req[:, j] - j * E).astype(np.int16) for j in range(J)}
+        z.update({f"L{first + j}_ok": np.float64(1.0) for j in range(J)})
+        meta = dict(model=model, moe_layers=[first + j for j in range(J)], experts=E,
+                    k=spec.moe.k, source="moe_card: the card's routes")
+        np.savez(trace, meta=json.dumps(meta), **z)
+    if ref is None:                             # a smoke test: no comparison
+        return dict(tokens=got, match=None, first_diff=None, text=text)
+    diff = next((i for i, (a, b) in enumerate(zip(got, ref["tokens"])) if a != b), None)
+    at = None
+    if diff is not None and "top" in ref:       # HF's 8 best at the first different pick
+        at = dict(hf=ref["tokens"][diff], card=got[diff], hf_top=ref["top"][diff],
+                  card_top=top[diff] if top else None)
+    return dict(tokens=got, match=got == ref["tokens"][:len(got)], first_diff=diff,
+                at_first_diff=at,
+                experts_per_layer=experts, slots=L.layers * experts, pool=L.layers * L.E,
+                policy=policy, embed_host=bool(getattr(eng.image, "embed_host", False)),
+                row_requests=eng.row_server.seq if eng.row_server is not None else None,
+                hint=spec.moe.hint,
+                hints=dict(served=srv.hints, prefetched=srv.prefetched, promoted=srv.promoted,
+                           dropped=srv.dropped, withdrawn=srv.withdrawn, part=srv.part,
+                           drop=srv.drop, n=srv.hint_n, top=srv.hint_top)
+                if spec.moe.hint else None,
+                image_mib=round(eng.image.nbytes / 2**20), slot_mb=round(L.slot_bytes / 1e6, 2),
+                requests=len(srv.history), hits=srv.hits, misses=srv.misses,
+                misses_per_token_decode=round(float(dec.mean()), 2) if len(dec) else None,
+                expert_uses_per_token=J * spec.moe.k,
+                misses_per_token_decode_2nd_half=round(float(dec[len(dec) // 2:].mean()), 2)
+                if len(dec) else None,
+                misses_per_token=mpt.tolist(), layer_major=layer_major,
+                pooled=pooled if layer_major else None,
+                embed_runs=embed_runs if layer_major else None,
+                layer_ahead=layer_ahead if layer_major else None,
+                expert_major=expert_major if layer_major else None,
+                em_rows=getattr(eng, "em_rows", 0) if layer_major else None,
+                ahead_part=eng.ahead_part if eng.layer_hint or eng.expert_major else None,
+                release_weights=release_weights, willneed=willneed, pool_map=pool_map,
+                legacy_serve=legacy_serve, poll_idle=poll_idle,
+                idle_parts=dict(mode=idle_parts, holds=srv.holds, stage_holds=srv.stage_holds,
+                                part_ms=srv.part_s and round(srv.part_s * 1e3, 3),
+                                staged=getattr(srv.mem, "staged", None)),
+                pacer=dict(sleeps=pacer.sleeps, slept_s=round(pacer.slept, 3),
+                           kinds=len(pacer.gaps)) if pacer is not None else None,
+                prefill_requests=pre if layer_major else None,
+                prefill_misses=sum(per_req[:pre]) if layer_major else None,
+                prefill_time=prefill_time,
+                load_s=round(load_s), prefill_s=round(prefill_s), generate_s=round(gen_s),
+                loop="host" if host_loop else "card", embed=spec.embed,
+                backend="card" if on_card else "isa", cfg=cfg_file, prefill_logits_sha=lg_sha,
+                decode_cycles=cyc, core_khz=khz,
+                tok_s_wall=round(len(got) / gen_s, 2) if gen_s else None,
+                tok_s_device=round(len(got) / dev_s, 2) if dev_s else None,
+                waits=dict(prefill=waits_prefill, decode=waits_decode),
+                host_decode_s=host,
+                pool_warm=dict(packed_gb=round(len(pf.ids) * pf.slot / 1e9, 2),
+                               split=pf.split, resident_gb_at_open=None
+                               if pf.resident_at_open is None else
+                               round(pf.resident_at_open / 1e9, 2),
+                               at_load=warm_load, at_decode=warm_decode, at_end=warm_end)
+                if warm else None,
+                host_mem=dict(at_decode=mem_decode, at_end=mem_end),
+                device_counters={k: v - snap0[k] for k, v in snap1.items()} if snap1 else None,
+                misses_per_request_decode=per_req[pre + prompt * J:pre + T * J],
+                bytes_per_token_decode=round(host["bytes"] / max(1, len(got))),
+                top=top or None)
+
+
+def main():
+    if os.environ.get("OTPU_PROFILE"):          # OTPU_PROFILE=1: where the host's time goes
+        import cProfile
+        import pstats
+        pr = cProfile.Profile()
+        os.environ.pop("OTPU_PROFILE")           # (the call below is the run itself)
+        pr.enable()
+        try:
+            return main()
+        finally:
+            pr.disable()
+            st = pstats.Stats(pr)
+            with open(os.environ.get("OTPU_PROFILE_OUT", "/tmp/otpu-profile.txt"), "w") as f:
+                st.stream = f
+                st.sort_stats("tottime").print_stats(30)
+                st.sort_stats("cumulative").print_stats(30)
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("model")
+    ap.add_argument("--hf", help="write HF's greedy tokens here")
+    ap.add_argument("--check", help="HF's tokens (--hf's output) to compare the card's with")
+    ap.add_argument("--no-check", action="store_true",
+                    help="no reference: run and print the tokens (a smoke test on the card)")
+    ap.add_argument("-n", type=int, default=16, help="tokens to generate")
+    ap.add_argument("--prompt", default=PROMPT, help="HF: the user turn")
+    ap.add_argument("--experts", default="0",
+                    help="expert slots per MoE layer (0: as many as fit); a list gives them "
+                         "per layer, e.g. 256,8x39: the first layer holds every expert")
+    ap.add_argument("--cap", type=int, default=4096, help="KV capacity")
+    ap.add_argument("--pool", help="the expert pool file (each expert packed once, reused)")
+    ap.add_argument("--max-memory", help="HF: host RAM for weights, the rest to disk (e.g. 10GiB)")
+    ap.add_argument("--out", help="the card's result as JSON")
+    ap.add_argument("--embed", choices=["int8", "f32"], default=None,
+                    help="Spec.embed (default the model's: int8 for a MoE, the rows gathered on "
+                         "the device from the int8 head or table), or an fp32 table (1 GiB for "
+                         "LFM2.5-8B-A1B)")
+    ap.add_argument("--trace", help="save the card's routes as a router trace (cachesim.py)")
+    ap.add_argument("--host-loop", action="store_true",
+                    help="decode with the resident step programs and the argmax on the host, "
+                         "the device's 8 best logits per step in the result (a diagnostic: "
+                         "where a run parts from HF's)")
+    ap.add_argument("--cfg", help="the configuration, pickled (tools/qual/refs.py cfg: the "
+                                  "bitstream's); default isasim.board_config()")
+    ap.add_argument("--card", action="store_true",
+                    help="run on the card (/dev/xdma0) instead of the ISA simulator")
+    ap.add_argument("--resident", action="store_true",
+                    help="every expert in a pool slot on the card, the host moving a window a "
+                         "layer (OTPU_RESIDENT=1; docs/u200.md): needs the U200 "
+                         "and its fp24 image, and its ISA reference is a streamed run's")
+    ap.add_argument("--policy", choices=("lru", "lfu"), default="lfu",
+                    help="the expert slots' replacement (ExpertServer): least recently used, or "
+                         "least decayed use")
+    ap.add_argument("--embed-table", choices=("host", "card"), default=None,
+                    help="an untied int8 embedding table on the host (embed_host: the card asks "
+                         "for each token's row; a MoE's default) or on the card")
+    ap.add_argument("--wformat", default="fp4", help="the weights' format (the experts' too)")
+    ap.add_argument("--head-format", default="int8", help="the LM head's format")
+    ap.add_argument("--formats", help="per-kind formats, OTPU_FORMATS (Gemma 4: experts=fp4)")
+    ap.add_argument("--hint-part", type=int, default=0,
+                    help="KiB of a hinted expert per idle poll (default: ExpertServer's 512)")
+    ap.add_argument("--hint-drop", action="store_true",
+                    help="a request withdraws its layer's hinted experts it does not name")
+    ap.add_argument("--hint-n", type=int, default=0,
+                    help="a hint's experts sent, at most (0: every one not in a slot; "
+                         "docs/offload.md 12.7)")
+    ap.add_argument("--hint-top", type=int, default=0,
+                    help="of a hint's first ids only (its router's best first; 0: all k)")
+    ap.add_argument("--hint-trace", help="the decode's hint and request timeline as JSON")
+    ap.add_argument("--prefill-trace",
+                    help="the prompt's timeline as JSON: each run (its layer run, start, done, "
+                         "halted, counters) and each request (seen, served, misses, ids)")
+    ap.add_argument("--hints", choices=("on", "off"), default=None,
+                    help="the router's prefetch hints before each mixer (docs/offload.md 12; "
+                         "default: the model's, on for Qwen3.5-MoE)")
+    ap.add_argument("--layer-major", type=int, default=0, metavar="R",
+                    help="prefill a layer at a time in runs of R rows (docs/offload.md 13; "
+                         "default 0: token by token)")
+    ap.add_argument("--per-layer-slots", action="store_true",
+                    help="--layer-major with each layer's own slots (default: pooled)")
+    ap.add_argument("--idle-parts", choices=IDLE_PARTS, default="v2",
+                    help="the hinted / ahead experts' parts on idle polls (docs/offload.md "
+                         "13.12): ra read ahead, one call each; v1 as before (cut in two, "
+                         "each read after the last one's DMA); halt none started near a run's "
+                         "expected end; v2 both (the default since session 18)")
+    ap.add_argument("--layer-ahead", metavar="index|hint|TRACES",
+                    help="--layer-major with pooled slots: the next MoE layer's experts sent "
+                         "while a layer runs (docs/offload.md 13.7), each layer's in index "
+                         "order, the card's hints (each layer run's router of the next layer on "
+                         "its output rows, 13.9) or by their use in router traces "
+                         "(comma-separated .npz)")
+    ap.add_argument("--expert-major", action=argparse.BooleanOptionalAction, default=None,
+                    help="--layer-major with pooled slots: each MoE layer of a chunk routed in "
+                         "its runs, its experts in one expert run (Engine expert_major; "
+                         "docs/offload.md 13.11, 13.13; the server's need lines and scratch: "
+                         "13.14). The default with --layer-major, pooled slots and no "
+                         "--layer-ahead (13.15) for a prompt of the family's "
+                         "streamed.EM_ROWS rows or more (13.16); --expert-major for any "
+                         "prompt, --no-expert-major for the layer-major base")
+    ap.add_argument("--ahead-part", type=int, metavar="KiB",
+                    help="--layer-ahead hint and --expert-major: the KiB an idle poll sends of "
+                         "a queued expert (default: expert-major streamed.NEED_PART, 4096, the "
+                         "hints qwen3.AHEAD_PART, 1024; at least a slot: one part an expert)")
+    ap.add_argument("--embed-runs", action="store_true",
+                    help="--layer-major with the embed runs and compile-time-position runs "
+                         "for an embedding table on the host (Engine embed_runs; needs a "
+                         "bitstream whose port A drops its beats at RUN: docs/offload.md 13.6)")
+    ap.add_argument("--keep-weights", action="store_true",
+                    help="keep the checkpoint mapped after the image is built (by default "
+                         "LazyWeights.release gives its pages back: page cache for the pool; "
+                         "docs/offload.md 10.6)")
+    ap.add_argument("--no-willneed", action="store_true",
+                    help="read a request's misses from the pool one after another (by default "
+                         "PoolFile.willneed queues those not in the page cache at once)")
+    ap.add_argument("--no-pool-map", action="store_true",
+                    help="read the pool through read() only (by default each read is also "
+                         "touched through a read-only map of the pool: its page cache's standing "
+                         "under MGLRU, docs/offload.md 10.7)")
+    ap.add_argument("--legacy-serve", action="store_true",
+                    help="serve as before docs/offload.md 10.8 (A/B): a request's first miss in "
+                         "halves, its reads through buffer lists, each victim's entry cleared "
+                         "before its slot is written, a 50 us sleep between empty polls")
+    ap.add_argument("--poll-idle", default=None, metavar="spin|S|predict",
+                    help="the decode's polls that find nothing: spin (the card's default), "
+                         "sleep S seconds, or predict (PollPacer: sleep most of each gap's "
+                         "expected length, then spin; docs/offload.md 10.10)")
+    ap.add_argument("--release-weights", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--willneed", action="store_true", help=argparse.SUPPRESS)  # (the default)
+    a = ap.parse_args()
+    if a.resident:                              # (the image's layout and the engine read it)
+        os.environ["OTPU_RESIDENT"] = "1"
+    if a.hf:
+        r = hf_greedy(a.model, a.n, a.max_memory, a.prompt)
+        Path(a.hf).write_text(json.dumps(r, indent=1))
+        print(json.dumps(r))
+        return
+    ref = json.loads(Path(a.check).read_text()) if a.check else None
+    if ref is None and not a.no_check:
+        raise SystemExit("moe_card: --check (HF's tokens) or --no-check")
+    r = card(a.model, ref, a.n, _slots(a.experts), a.cap, a.pool, a.host_loop, a.embed, a.trace,
+             a.cfg, a.card, a.policy,
+             None if a.embed_table is None else a.embed_table == "host",
+             None if a.hints is None else a.hints == "on", a.hint_part << 10, a.hint_drop,
+             a.hint_n, a.hint_top, a.hint_trace, a.wformat, a.head_format, a.formats, a.layer_major,
+             not a.per_layer_slots, not a.keep_weights, not a.no_willneed,
+             not a.no_pool_map, a.legacy_serve, a.embed_runs, a.poll_idle, a.prefill_trace,
+             a.layer_ahead, a.ahead_part << 10 if a.ahead_part else None, a.idle_parts,
+             a.expert_major)
+    print(json.dumps(r))
+    if a.out:
+        Path(a.out).write_text(json.dumps(r, indent=1))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,64 @@
+# The Alveo U200 (Xilinx; board part xcu200-fsgd2104-2-e): the retail VCU1525 board (the
+# BCU1525's platform) with production silicon. Same package (fsgd2104), pinout (au200's
+# part0_pins.xml == vcu1525's, checked) and DIMMs (MTA18ASF2G72PZ-2G3, DDR4-2400, x4, ECC) as
+# the BCU1525, but a different device: xcu200 (JTAG IDCODE 0x04b37093) against the VCU1525's
+# xcvu9p (0x04b31093), so the BCU1525's bitstream does not load here. Everything else is the
+# BCU1525's (docs/bcu1525.md): two slices, each on two DDR4 channels, XDMA Gen3 x16, the same
+# LiteDRAM DDR4 core and board top (boards/bcu1525; [platform] board). Development builds run
+# 100 MHz first, DDR4-1600 (mem_mts), as targets/bcu1525.toml.
+
+[target]
+name = "u200"
+kind = "fpga"
+platform_id = 3
+description = "Alveo U200: xcu200-fsgd2104-2-e (VCU1525 board), 4 x DDR4 DIMM, XDMA Gen3; 2 slices x 2 channels"
+
+[arch]
+S = 2
+D = 128
+MCOLS = 4
+ACT_BLOCKS = 128
+ACT_ROWS = 0
+TMEM_WORDS = 65536
+IMEM_WORDS = 32768
+DRAM_BYTES = 4294967296         # per slice: 32-bit DRAM addresses (2 GiB of each of its channels)
+LANES = 8
+PAIR = true
+DSTEP = true
+STREAM = true
+SEQ_WC = false                  # the sequencer's wait entries (WAITC, EXPERIMENTAL: docs/seq_vpu.md):
+#                                 the host loads them with every program; needs WIN <= 16
+
+[uarch]
+MXU_IMPL = 2
+MXU_CL = 16
+VPU_CL = 2
+ULANES = 8
+TMEM_IMPL = 0
+RPB = 0
+WPB = 1
+WIN = 16
+FIFO_DEPTH = 1024
+TRACE_DEPTH = 16384
+PQ_WIN = 1024
+CHASH = true
+
+[tech]
+family = "xilinxus"             # rtl/tech/xilinxus: DSP48E2 cells
+part = "xcu200-fsgd2104-2-e"    # the Alveo U200's device (the XRT platform's part)
+vendor = "xilinx"
+
+[platform]
+board = "bcu1525"               # the same top, block design and DDR4 core (boards/bcu1525)
+core_mhz = 100.0                # development builds first (docs/bcu1525.md 2)
+mem = "ddr4"
+mem_mts = 1600                  # LiteDRAM's USPDDRPHY at 200 MHz first; the RDIMMs are DDR4-2400
+mem_ctrl = "litedram"
+hostcal = false
+channels_per_slice = 2
+channel_bytes = 2147483648      # addressed per channel by a slice (a DIMM holds up to 16 GiB)
+channel_phys_bytes = 17179869184  # an MTA18ASF2G72PZ RDIMM (16 GiB)
+beat_bytes = 64
+host = "pcie"
+pcie_gen = 3
+pcie_lanes = 16                 # GTY quads 224-227 (SLR1), XDMA 512 bits at 250 MHz

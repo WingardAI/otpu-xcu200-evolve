@@ -1,0 +1,36 @@
+[project]
+name = "opentpu"
+version = "0.1.0"
+description = "openTPU: thin LLM inference accelerator -- SystemVerilog RTL, ISA simulator, Triton-style language and compiler"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = ["numpy", "textual"]
+
+[project.optional-dependencies]
+# MiniCPM-V's images (opentpu/llm/minicpmv.py): torchvision's decode and resize as HF's processor,
+# pillow's decode without it; the card's references ran with torchvision 0.29.1 and pillow 12.3.0
+# (docs/minicpmv.md 6)
+minicpmv = ["pillow", "torchvision"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[project.scripts]
+otpu-lens = "opentpu.host.hwlens:main"
+otpu-smi = "opentpu.host.smi:main"
+otpu-lock = "opentpu.host.runstate:hold_main"
+otpu-selftest = "opentpu.host.selftest:main"
+otpu-diag = "opentpu.host.diag:main"
+otpu-chat = "opentpu.host.chat:main"
+otpu-serve = "opentpu.serve.api:main"
+otpu-setup = "opentpu.host.pcie_setup:main"
+otpu-i2c = "opentpu.host.i2c:main"
+otpu-memcal = "opentpu.host.memcal:main"
+otpu-ddr4 = "opentpu.host.ddr4:main"
+
+[tool.setuptools.packages.find]
+include = ["opentpu*"]
+
+[tool.setuptools.package-data]
+opentpu = ["lens_app.html", "host/setup_pcie.sh", "host/pcie/*", "host/litedram/*", "host/litedram4/*"]

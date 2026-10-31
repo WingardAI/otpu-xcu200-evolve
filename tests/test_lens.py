@@ -1,0 +1,288 @@
+"""openTPU Lens: profile files, recording on the RTL and the ISA simulator, the app page and
+its local server."""
+import gzip
+import json
+import re
+import shutil
+import subprocess
+import urllib.request
+
+import pytest
+
+from opentpu import lens
+
+
+@pytest.fixture(scope="module")
+def rtl_prof(have_verilator):
+    return lens.record("mlp-small")
+
+
+def test_record_rtl_has_timeline_and_counters(rtl_prof):
+    d = rtl_prof
+    assert d["kind"] == "rtl" and d["cycles"] > 0 and d["instrs"]
+    assert 0 < d["roofline"]["efficiency"] <= 1.0
+    b = d["slices"][0]["buckets"]
+    # P and Q trace lines are bucketed together
+    for k in ("c", "n", "bm", "bd", "mx", "fm", "bs", "ms", "mb", "ff"):
+        assert k in b and len(b[k]) == len(b["c"])
+    assert sum(b["n"]) >= d["cycles"] - 2
+    # every dynamic instruction points into the program and has a consistent interval
+    progs = d["programs"]
+    for r in d["instrs"]:
+        s, pc, disp, start, end = r[0], r[2], r[6], r[9], r[10]
+        assert 0 <= pc < len(progs[s])
+        assert disp <= start <= end
+
+
+def test_file_round_trip(tmp_path, rtl_prof):
+    f = lens.save([rtl_prof], tmp_path / "a.otpuprof")
+    assert f.read_bytes()[:2] == b"\x1f\x8b"                      # gzip
+    doc = lens.load(f)
+    assert doc["format"] == lens.FORMAT and doc["version"] == lens.VERSION
+    assert doc["profiles"][0] == json.loads(json.dumps(rtl_prof))
+    # plain JSON is accepted too
+    plain = tmp_path / "b.json"
+    plain.write_bytes(gzip.decompress(f.read_bytes()))
+    assert lens.load(plain)["profiles"][0]["cycles"] == rtl_prof["cycles"]
+
+
+def test_rejects_other_files_and_newer_versions(tmp_path):
+    p = tmp_path / "x.json"
+    p.write_text(json.dumps({"format": "something"}))
+    with pytest.raises(ValueError):
+        lens.load(p)
+    p.write_text(json.dumps({"format": lens.FORMAT, "version": lens.VERSION + 1, "profiles": []}))
+    with pytest.raises(ValueError):
+        lens.load(p)
+
+
+def test_isa_profile():
+    d = lens.record("mlp-small", isa=True)
+    assert d["kind"] == "isa" and d["instrs"] and d["cycles"] > 0
+    assert d["roofline"]["bound"] > 0
+    # analytic timing: back to back
+    rs = [r for r in d["instrs"] if r[0] == 0]
+    assert all(a[10] == b[9] for a, b in zip(rs, rs[1:]))
+
+
+def test_board_profile():
+    from opentpu.isasim import board_config
+    from opentpu import isa as I
+    prog = [I.ld(0, 0, 64), I.halt()]
+    d = lens.board_data("board run", board_config(), [prog],
+                        {"cycles": 200, "b_reads": 2, "b_writes": 0, "a_reads": 0, "a_writes": 0})
+    assert d["kind"] == "board" and d["board"]["cycles"] == 200 and d["roofline"]["bound"] == 2
+
+
+def test_html_embeds_profile(tmp_path, rtl_prof):
+    f = lens.save([rtl_prof], tmp_path / "a.otpuprof")
+    html = lens.render(lens.load(f))
+    assert "/*__DATA__*/" not in html and '"openTPU-profile"' in html
+    assert "</script>" in html and html.count("<script>") == 1
+
+
+def test_app_javascript_parses(tmp_path):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not installed")
+    js = re.search(r"<script>(.*)</script>", lens.APP.read_text(), re.S).group(1)
+    f = tmp_path / "app.js"
+    f.write_text(js)
+    r = subprocess.run([node, "--check", str(f)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def test_server_serves_app_and_profile(tmp_path, rtl_prof):
+    f = lens.save([rtl_prof], tmp_path / "a.otpuprof")
+    srv = lens.serve(f, port=0, open_browser=False, block=False)
+    try:
+        page = urllib.request.urlopen(srv.url, timeout=10).read().decode()
+        assert "openTPU" in page and '"/profile"' in page
+        raw = urllib.request.urlopen(srv.url + "profile", timeout=10).read()
+        assert raw == f.read_bytes()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+
+def test_floorplan_explains_every_element(tmp_path, have_verilator):
+    """Headless Chrome: the app's #selftest hovers and pins every floorplan element at several
+    moments of a tiny Qwen3 token; every one must show an explanation, with no errors."""
+    import html as H
+    import os
+    chrome = CHROME if os.path.exists(CHROME) else (shutil.which("google-chrome")
+                                                     or shutil.which("chromium"))
+    if not chrome:
+        pytest.skip("Chrome not installed")
+    d = lens.record("qwen-tiny", board=True, axi=True, pos=10)
+    page = tmp_path / "q.html"
+    page.write_text(lens.render(lens.load(lens.save([d], tmp_path / "q.otpuprof"))))
+    r = subprocess.run([chrome, "--headless=new", "--disable-gpu", "--window-size=1400,1150",
+                        "--virtual-time-budget=60000", "--enable-logging=stderr", "--v=0",
+                        "--dump-dom", f"file://{page}#selftest"],
+                       capture_output=True, text=True, timeout=300)
+    m = re.search(r'<pre id="selftest">(.*?)</pre>', r.stdout, re.S)
+    assert m, r.stderr[-2000:]
+    res = json.loads(H.unescape(m.group(1)))
+    kinds = {k.split(":")[0] for k in res["keys"]}
+    assert {"seq", "slot", "dma", "mxu", "fifo", "col", "quant", "act", "tmem", "bank", "vpu",
+            "clane", "slane", "coll", "axi", "axiA", "axiB", "dram0", "dram1", "ctrl", "flow",
+            "state", "gap", "ctl"} <= kinds
+    assert not res["fails"] and not res["errors"], res
+    assert not [ln for ln in r.stderr.splitlines() if "Uncaught" in ln]
+
+
+def test_cli_info(tmp_path, rtl_prof, capsys):
+    f = lens.save([rtl_prof], tmp_path / "a.otpuprof")
+    lens.main(["info", str(f)])
+    out = capsys.readouterr().out
+    assert "openTPU-profile v1" in out and rtl_prof["name"] in out
+
+
+def test_cli_summary_isa(tmp_path, capsys):
+    """ISA mlp-small: the terminal overview names the run, the roofline, units and classes."""
+    d = lens.record("mlp-small", isa=True)
+    f = lens.save([d], tmp_path / "isa.otpuprof")
+    lens.main(["summary", str(f)])
+    out = capsys.readouterr().out
+    assert d["name"] in out and "[isa]" in out
+    assert "Roofline" in out and "of DRAM-bound minimum" in out
+    assert "Unit utilisation" in out and "MXU" in out
+    assert "By instruction class" in out and "MM" in out
+    assert "Findings" in out
+    m = lens.summary_data(d)
+    assert m["cycles"] == d["cycles"] and m["kind"] == "isa"
+    assert m["causes"] is None                    # ISA profiles have no P/Q buckets
+    assert m["n_instr"] == sum(1 for r in d["instrs"] if r[0] == 0)
+    assert any(r["name"] == "MM" and r["n"] > 0 for r in m["classes"])
+    lens.main(["summary", str(f), "--json"])
+    (j,) = json.loads(capsys.readouterr().out)
+    assert j["name"] == d["name"] and j["roofline"]["bound"] == d["roofline"]["bound"]
+    from opentpu.host import hwlens
+    assert hwlens.main(["summary", str(f)]) == 0
+    assert "Roofline" in capsys.readouterr().out
+
+
+def _bucket_prof(n=100, bm=50, bd=10, bs=12, ms=8, mb=4, fm=2):
+    """Minimal RTL-shaped profile: P/Q buckets only, for the terminal cause table."""
+    return {
+        "kind": "rtl", "name": "synth-mlp", "cycles": n, "clock_mhz": 100,
+        "config": {"S": 1, "D": 64, "MCOLS": 2, "LANES": 8},
+        "roofline": {"bound": bm + bd, "efficiency": (bm + bd) / n},
+        "macs": 0, "peak_macs": 128, "bytes": 0,
+        "units": ["DMA", "MXU", "QUANT", "VPU", "COLL"],
+        "instrs": [
+            [0, 0, 0, 1, "MM", "", 0, 0, 0, 0, 80, -1, {}, 80, bm, 0],
+            [0, 1, 1, 0, "LD", "", 0, 0, -1, 0, 20, -1, {}, 20, bd, 0],
+        ],
+        "slices": [{"ports": {"bmxu": bm, "bdma": bd}, "busy": {"MXU": 80, "DMA": 20},
+                    "lose": {"MXU drain": fm},
+                    "buckets": {"c": [n - 1], "n": [n], "bm": [bm], "bd": [bd], "bs": [bs],
+                                "ms": [ms], "mb": [mb], "fm": [fm], "mx": [40],
+                                "fq": [0], "fv": [0], "fc": [0], "as": [0]}}],
+        "sources": [], "notes": [{"level": "warn", "text": "Near the roofline."}],
+    }
+
+
+def test_cli_summary_port_b_causes(tmp_path, capsys):
+    """Every DRAM port-B cycle is streaming or an idle cause (same order as the app)."""
+    d = _bucket_prof()
+    f = lens.save([d], tmp_path / "rtl.otpuprof")
+    lens.main(["summary", str(f)])
+    out = capsys.readouterr().out
+    assert "Where the cycles went" in out and "DRAM port B streaming" in out
+    assert "MXU starved" in out and "Biggest losses:" in out
+    tot = lens.port_b_causes(d)
+    assert tot and tot["busy"] == 60
+    n = sum(d["slices"][0]["buckets"]["n"])
+    assert abs(sum(tot.values()) - n) < 1e-6
+
+
+def test_cli_summary_rejects_slice_past_the_profile(tmp_path, capsys):
+    """--slice past the profile's slices is an error that names the valid range."""
+    d = _bucket_prof()
+    wider = _bucket_prof()
+    wider["name"] = "two-slice"
+    wider["slices"] = wider["slices"] * 2
+    f = lens.save([d, wider], tmp_path / "rtl.otpuprof")
+    lens.main(["summary", str(f), "--slice", "0"])
+    out = capsys.readouterr().out
+    assert "slice 0" in out and "2 instructions" in out
+    with pytest.raises(SystemExit, match=r"'synth-mlp' \(valid range: 0\.\.0\)"):
+        lens.main(["summary", str(f), "--slice", "1"])
+    assert capsys.readouterr().out == ""
+    with pytest.raises(SystemExit, match=r"valid range: 0\.\.0"):
+        lens.main(["summary", str(f), "--json", "--slice", "1"])
+    only = lens.save([wider], tmp_path / "wide.otpuprof")
+    lens.main(["summary", str(only), "--slice", "1"])
+    shown = capsys.readouterr().out
+    assert "slice 1" in shown and "0 instructions" in shown
+    with pytest.raises(SystemExit, match=r"'two-slice' \(valid range: 0\.\.1\)"):
+        lens.main(["summary", str(only), "--slice", "2"])
+    with pytest.raises(SystemExit, match=r"valid range: 0\.\.1"):
+        lens.main(["summary", str(only), "--slice", "-1"])
+    empty = _bucket_prof()
+    empty["slices"] = []
+    with pytest.raises(SystemExit, match=r"valid range: none"):
+        lens.render_summary(empty)
+
+
+def _fields(line: str, widths: list[int], lead: int = 2) -> list[str]:
+    out, i = [], lead
+    for w in widths:
+        out.append(line[i:i + w])
+        i += w + 1
+    return out
+
+
+def test_summary_class_column_fits_vop_exp2sub():
+    """The class column grows past 10 so VOP.exp2sub stays aligned with the header."""
+    d = _bucket_prof()
+    short = lens.render_summary(d)
+    hdr = next(ln for ln in short.splitlines() if ln.strip().startswith("class"))
+    assert hdr.index("n") == 17                          # glyph of a 10-wide class column
+    d["instrs"].append([0, 2, 2, 3, "VOP.exp2sub", "", 0, 0, -1, 0, 10, -1, {}, 10, 0, 0])
+    lines = lens.render_summary(d).splitlines()
+    hdr = next(ln for ln in lines if ln.strip().startswith("class"))
+    widths = [len("VOP.exp2sub"), 5, 8, 8, 7, 7, 6]
+    hdr_f = _fields(hdr, widths)
+    assert [c.strip() for c in hdr_f] == ["class", "n", "busy", "work", "dep", "unit", "DRAM"]
+    rows = [ln for ln in lines if ln.strip().split()[0] in ("MM", "LD", "VOP.exp2sub")]
+    assert [ln.strip().split()[0] for ln in rows] == ["MM", "LD", "VOP.exp2sub"]
+    for ln in rows:
+        got = _fields(ln, widths)
+        assert got[0] == f"{ln.strip().split()[0]:<{widths[0]}}"
+        assert all(c == f"{c.strip():>{w}}" for c, w in zip(got[1:], widths[1:]))
+
+
+def test_summary_board_lists_print_as_numbers():
+    d = _bucket_prof()
+    d["board"] = {"cycles": 200, "instructions": [11077], "ecc_ded": False,
+                  "per_slice": [11077, 42]}
+    text = lens.render_summary(d)
+    assert "[11077]" not in text
+
+    def val(key):
+        line = next(ln for ln in text.splitlines() if ln.strip().startswith(key))
+        return line.strip().split(None, 1)[1]
+
+    assert val("instructions") == "11077"
+    assert val("per_slice") == "11077, 42"
+    assert val("cycles") == "200"
+    assert val("ecc_ded") == "False"
+
+
+def test_summary_json_default_uses_item_or_typeerror():
+    """numpy floats stay floats; a non-scalar is a TypeError, not a circular reference."""
+    import numpy as np
+    assert lens._json_default(np.float64(1.9)) == 1.9
+    assert type(lens._json_default(np.float64(1.9))) is float
+    assert lens._json_default(np.int64(3)) == 3
+    with pytest.raises(TypeError, match="not JSON serializable"):
+        lens._json_default(object())
+    with pytest.raises(TypeError, match="not JSON serializable"):
+        json.dumps({"a": np.arange(2)}, default=lens._json_default)
+    assert json.loads(json.dumps({"a": np.float64(1.9)}, default=lens._json_default))["a"] == 1.9

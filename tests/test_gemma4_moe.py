@@ -1,0 +1,735 @@
+"""Gemma 4 26B-A4B's parts of opentpu/llm/gemma4.py against Hugging Face transformers, on tiny
+random models: global layers with their own KV head count and K = V (attention_k_eq_v), no
+per-layer inputs (PLE), a dense MLP width that is not a multiple of 2D (the image pads it),
+and the MoE block beside the MLP (enable_moe_block)."""
+import json
+
+import numpy as np
+import pytest
+
+import opentpu.llm.gemma4 as G
+from opentpu import quant as QU
+from opentpu.llm.qwen3 import Engine
+
+torch = pytest.importorskip("torch")
+transformers = pytest.importorskip("transformers")
+pytest.importorskip("transformers.models.gemma4")
+
+S_, F_ = "sliding_attention", "full_attention"
+KINDS = (S_, S_, F_, S_, S_, F_)
+
+
+def _model(tmp_path_factory, name, **kw):
+    """head_dim 128 (sliding) and 256 (global, 32 rotated pairs), 4 query heads on 2 KV heads
+    (sliding) and on 1 (global, K = V), the MLP 320 wide, no PLE; norms and the router's scales
+    random, k_norm near the real model's 0.13 (test_gemma4's tiny)."""
+    torch.manual_seed(0)
+    hc = transformers.Gemma4TextConfig(
+        hidden_size=256, num_hidden_layers=len(KINDS), num_attention_heads=4,
+        num_key_value_heads=2, num_global_key_value_heads=1, attention_k_eq_v=True,
+        head_dim=128, global_head_dim=256, intermediate_size=320, vocab_size=1000,
+        hidden_size_per_layer_input=0, layer_types=list(KINDS), num_kv_shared_layers=0,
+        sliding_window=512, final_logit_softcapping=30.0, max_position_embeddings=4096, **kw)
+    hc._attn_implementation = "eager"
+    m = transformers.models.gemma4.modeling_gemma4.Gemma4ForCausalLM(hc).float().eval()
+    with torch.no_grad():
+        for n, p in m.named_parameters():
+            if "norm" in n or n.endswith("router.scale"):
+                k = "k_norm" in n
+                p.copy_((0.13 if k else 1.0) + (0.01 if k else 0.1) * torch.randn_like(p))
+            elif n.endswith("per_expert_scale"):
+                p.copy_(0.5 + torch.rand_like(p))
+            elif "experts" in n or "router" in n:   # (a router decisive enough that the
+                p.copy_((0.5 if "router.proj" in n else 0.05) * torch.randn_like(p))  # int8 one
+                # mostly picks the same experts: its logits ~1 apart, not ~0.1)
+        for n, b in m.named_buffers():
+            if n.endswith("layer_scalar"):
+                b.copy_(0.5 + torch.rand_like(b))
+    W = {k: v.float().numpy() for k, v in m.state_dict().items()}
+    d = tmp_path_factory.mktemp(name)
+    (d / "config.json").write_text(json.dumps(hc.to_dict()))
+    return m, W, G.Spec.from_hf(d)
+
+
+@pytest.fixture(scope="module")
+def kv(tmp_path_factory):
+    """No MoE: the attention, PLE and MLP-width parts alone."""
+    return _model(tmp_path_factory, "kv")
+
+
+@pytest.fixture(scope="module")
+def moe(tmp_path_factory):
+    """8 experts 96 wide, top 2, beside the 320-wide MLP."""
+    return _model(tmp_path_factory, "moe", enable_moe_block=True, num_experts=8,
+                  top_k_experts=2, moe_intermediate_size=96)
+
+
+@pytest.fixture(scope="module")
+def moe_g2(tmp_path_factory):
+    """moe with pre_feedforward_layernorm_2's gain heavy-tailed, as the 26B's (its max about 8x
+    its rms): 4 of the 256 channels 8x in every layer."""
+    m, _, spec = _model(tmp_path_factory, "moe_g2", enable_moe_block=True, num_experts=8,
+                        top_k_experts=2, moe_intermediate_size=96)
+    rng = np.random.default_rng(0)
+    with torch.no_grad():
+        for layer in m.model.layers:
+            g = layer.pre_feedforward_layernorm_2.weight
+            g[torch.tensor(rng.choice(g.shape[0], 4, replace=False))] *= 8
+    return m, {k: v.float().numpy() for k, v in m.state_dict().items()}, spec
+
+
+def test_spec(kv, moe):
+    _, _, s = kv
+    assert (s.n_kv, s.n_kv_global, s.k_eq_v, s.ple_dim, s.experts) == (2, 1, True, 0, 0)
+    assert [s.kvh(i) for i in range(s.layers)] == [2, 2, 1, 2, 2, 1]
+    assert [s.kv_same(i) for i in range(s.layers)] == [False, False, True] * 2
+    assert s.kv_src == tuple(range(6)) and s.ffn == (320,) * 6
+    _, _, s = moe
+    assert (s.experts, s.top_k, s.expert_ffn) == (8, 2, 96)
+
+
+@pytest.mark.parametrize("name", ["kv", "moe"])
+def test_reference_matches_hf(name, request):
+    m, W, spec = request.getfixturevalue(name)
+    toks = [int(t) for t in np.random.default_rng(0).integers(0, 1000, 32)]
+    with torch.no_grad():
+        hf = m(torch.tensor([toks])).logits[0].numpy()
+    assert np.abs(G.softcap(spec, G.reference_logits(spec, W, toks)) - hf).max() < 1e-4
+
+
+def _cfg():
+    from opentpu.isasim import board_config
+    return board_config(DRAM_BYTES=1 << 26)
+
+
+def _engine(kv, **kw):
+    _, W, spec = kv
+    return Engine(spec, W, cap=1024, cfg=_cfg(), **kw)
+
+
+def _cos(a, b):
+    a, b = a.reshape(len(a), -1), b.reshape(len(b), -1)
+    return (a * b).sum(1) / np.linalg.norm(a, axis=1) / np.linalg.norm(b, axis=1)
+
+
+@pytest.mark.parametrize("wf", ["int8", "fp4"])
+def test_image_pads_the_mlp(kv, wf):
+    """The 320-wide MLP in blocks of 384 (int8 down) or 512 (4-bit) rows / columns, the extra
+    gate / up rows zero; no PLE areas, no V projection in the global (K = V) layers, 2 KV heads
+    in the sliding layers' caches and 1 in the global layers'."""
+    _, W, spec = kv
+    e = _engine(kv, wformat=wf)
+    img, F = e.image, {"int8": 384, "fp4": 512}[wf]
+    assert img.wproj is None and img.ple_rec == 0 and not img.ple_host
+    for i in range(spec.layers):
+        o = img.bofs[img._key(i)]
+        assert o["mats"]["wg"][0] == F and len(o["wd"]) * img.dchunk[320, wf] == F
+        assert ("wv" in o["mats"]) == (spec.kinds[i] == G.SLIDE) and len(o["kv"]) == spec.kvh(i)
+        assert "wpg" not in o["mats"] and "g_ple" not in o
+    o, base = img.bofs[img._key(0)], img._off(0).static()
+    rb = {"int8": 256, "fp4": 128}[wf]
+    dram = e.backend.machine.slices[0].dram
+    assert not dram[base + o["wg"][0] + 320 * rb:base + o["wg"][0] + F * rb].any()
+
+
+@pytest.mark.parametrize("wf", ["int8", "fp4"])
+def test_device_matches_hf_and_emulation(kv, wf):
+    """The device against the emulation (its quantization points) in both formats, and int8
+    against HF (fp4 on random weights is far from it: cosine ~0.7)."""
+    m, W, spec = kv
+    toks = [int(t) for t in np.random.default_rng(0).integers(0, 1000, 24)]
+    with torch.no_grad():
+        hf = m(torch.tensor([toks])).logits[0].numpy()
+    e = _engine(kv, wformat=wf)
+    dev = np.array([G.softcap(spec, e.step(t)) for t in toks])
+    emu = G.softcap(spec, G.emulated_logits(spec, W, toks[:12], wformat=wf))
+    assert _cos(dev[:12], emu).min() > 0.99
+    if wf == "int8":
+        assert _cos(dev, hf).min() > 0.985
+
+
+@pytest.mark.parametrize("wf", ["int8", "fp4"])
+def test_resident_is_bit_exact(kv, wf):
+    """Resident decode (embedding gathered on the device, run-time masks) against the
+    per-position programs, across the first bucket boundary."""
+    toks = [int(t) for t in np.random.default_rng(2).integers(0, 1000, 300)]
+    a, b = _engine(kv, wformat=wf, resident=True), _engine(kv, wformat=wf)
+    assert a.resident and not b.resident
+    assert np.array_equal(a.prefill(toks[:250]), b.prefill(toks[:250]))
+    for t in toks[250:]:
+        assert np.array_equal(a.step(t), b.step(t))
+
+
+def test_sliding_k_rows_at_their_own_stride(kv):
+    """Spec.k_rows (from_hf: MoE models): the sliding layers' K rows at a row and its scales
+    (256 bytes here, not the RoPE row's 768): the same logits bit for bit, resident and
+    per-position, past the ring's wrap, and a smaller image."""
+    _, W, spec = kv
+    toks = [int(t) for t in np.random.default_rng(7).integers(0, 1000, 700)]
+    sk = G.replace(spec, k_rows=True)
+    a = Engine(sk, W, cap=1024, cfg=_cfg(), resident=True)
+    b = Engine(spec, W, cap=1024, cfg=_cfg(), resident=True)
+    c = Engine(sk, W, cap=1024, cfg=_cfg())
+    assert a.image.ks[G.SLIDE] == 256 and b.image.ks[G.SLIDE] == a.image.ps == 768
+    assert a.image.nbytes < b.image.nbytes
+    la, lb, lc = (e.prefill(toks[:680]) for e in (a, b, c))
+    assert np.array_equal(la, lb) and np.array_equal(la, lc)
+    for t in toks[680:]:
+        ra = a.step(t)
+        assert np.array_equal(ra, b.step(t)) and np.array_equal(ra, c.step(t))
+
+
+def test_chunked_prefill_is_bit_exact(kv):
+    toks = [int(t) for t in np.random.default_rng(4).integers(0, 1000, 11)]
+    a, b = _engine(kv), _engine(kv)
+    assert np.array_equal(a.prefill(toks, chunk=4), b.prefill(toks, chunk=1))
+    img = a.image
+    assert np.array_equal(a.backend.machine.slices[0].dram[img.layer0:img.head[0]],
+                          b.backend.machine.slices[0].dram[img.layer0:img.head[0]])
+
+
+K = 2                   # the tiny MoE's top k: the smallest expert cache
+
+
+def _moe_engine(moe, cfg=None, **kw):
+    _, W, spec = moe
+    return Engine(spec, W, cap=1024, cfg=cfg or _cfg(), rows=1, **kw)
+
+
+@pytest.mark.parametrize("wf,formats", [("int8", ""), ("fp4", ""), ("int8", "experts=nvfp4")])
+def test_moe_device_follows_the_emulation(moe, wf, formats):
+    """The MoE block on the device (moe.moe_ffn: the router and every expert on the card, the
+    dense MLP emitted beside the request, the two norms combined) follows the emulation of the
+    same quantization given the card's choice of experts (the emulation's own differs where
+    the k-th and the next logit are near a tie: the device's attention differs from the
+    emulation's by ~1e-3 from the second position on, as in every Gemma 4 model): the first
+    token to the VPU's EXP2 / RECIP (the routing weights' softmax, gelu_tanh: 1 - 1.2e-4
+    here), the others to cosine > 0.99. The card's experts in the first layer, whose input no
+    routing has touched, are the emulation's wherever its k-th logit is clear of the next;
+    int8 follows HF. The experts in nvfp4 over int8 layers too (the 26B's default on the card,
+    streamed.FORMATS)."""
+    m, W, spec = moe
+    spec = G.replace(spec, formats=formats)
+    toks = [int(t) for t in np.random.default_rng(1).integers(0, 1000, 12)]
+    eng = _moe_engine((m, W, spec), wformat=wf)
+    efmt = G.expert_format(spec, wf, formats)
+    assert eng.image.efmt == efmt == (formats[8:] if formats else wf)
+    assert (eng.image.fmt.F0, eng.image.fmt.F) == (96, 128 if efmt == "int8" else 256)
+    eng.server.history = []
+    dev = np.array([eng.step(t) for t in toks])
+    eng.server.poll()                   # (the last layer's request, served at a next fence)
+    L, E, card = spec.layers, spec.experts, eng.server.history
+    assert len(card) == len(toks) * L and eng.server.misses == 0
+    assert all(g // E == j % L for j, r in enumerate(card) for g in r)
+    routes = []
+    G.emulated_logits(spec, W, toks, wformat=wf, formats=formats, routes=routes)
+    clear = [(t, ids) for t, layer, ids, margin in routes if layer == 0 and margin > 0.05]
+    assert len(clear) >= len(toks) // 2
+    assert all(sorted(card[t * L]) == sorted(ids) for t, ids in clear)
+    emu = G.emulated_logits(spec, W, toks, wformat=wf, formats=formats, routing={
+        (j // L, j % L): [g % E for g in r] for j, r in enumerate(card)})
+    c = _cos(dev, emu)
+    assert c[0] > 1 - 2e-4 and c.min() > 0.99, c
+    if efmt == "int8":
+        with torch.no_grad():
+            hf = m(torch.tensor([toks])).logits[0].numpy()
+        assert np.median(_cos(G.softcap(spec, dev), hf)) > 0.98
+
+
+def test_formats_scan_on_the_cards_experts(moe, tmp_path):
+    """tools/formats_scan.py's rows for the 26B (--base experts=fp4,head=fp4, the card's): each
+    variant's NLL and KL divergence from float's are gemma4_quant_eval.emulate's under the
+    dense layers' formats on top of the base, the experts in the base's format; no PLE (no
+    table, no kind); a row's bytes are the dense layers' and the head's; the groups halve the
+    layers at a multiple of the attention period (the 26B: 0-11, 12-29); a variant's residual
+    checkpoint goes once its rows are in the cache."""
+    import importlib.util
+    from dataclasses import replace
+    from pathlib import Path
+    s = importlib.util.spec_from_file_location("formats_scan", Path(__file__).resolve().parent
+                                               .parent / "tools" / "formats_scan.py")
+    FS = importlib.util.module_from_spec(s)
+    s.loader.exec_module(FS)
+    E = FS._g4q()
+    _, W, spec = moe
+    toks = [int(t) for t in np.random.default_rng(5).integers(0, 1000, 24)]
+    base = "experts=fp4,head=fp4"
+    specs = {"float": None, "int8": (base, "int8", None),
+             "attn": (base + ",attn@0-2=fp4", "int8", None),
+             "mlp": (base + ",gateup@3-5=fp4,down=fp4", "int8", None)}
+    rows = FS._g4_run(spec, W, toks, specs, 128, None, tmp_path, head_rows=256)
+
+    def logp(lg):
+        lg = 30.0 * np.tanh(lg / 30.0)
+        m = lg.max(1, keepdims=True)
+        return lg - m - np.log(np.exp(lg - m).sum(1, keepdims=True))
+
+    lf = logp(E.emulate(spec, W, toks, wformat="none"))
+    tgt = np.arange(len(toks) - 1), toks[1:]
+    for lab, v in specs.items():
+        wf, hf, wmap, pf = FS._g4_args(spec, v)
+        assert pf == rows[lab]["ple_table"] == "none"
+        if v is not None:
+            assert (wmap["experts"], hf) == ("fp4", "fp4")
+        lq = logp(E.emulate(spec, W, toks, wformat=wf, hf=hf, ple_format=pf, wmap=wmap))
+        assert np.abs(np.asarray(rows[lab]["nll_tok"]) + lq[:-1][tgt]).max() < 1e-4
+        kl = (np.exp(lf) * (lf - lq)).sum(1)
+        assert np.abs(np.asarray(rows[lab]["kl_tok"]) - kl).max() < 1e-6
+    assert rows["attn"]["kl_float"] != rows["int8"]["kl_float"] != rows["mlp"]["kl_float"]
+    kept = [f.name for f in tmp_path.glob("*.npz")]
+    assert len([f for f in kept if ".ckpt" not in f]) == 4
+    assert not [f for f in kept if ".ckpt" in f]
+    shapes = FS._g4_shapes(spec, W)
+    assert not any("experts" in n or "per_layer" in n for n in shapes)
+    by = {lab: FS._g4_bytes(spec, shapes, v) for lab, v in specs.items() if v is not None}
+    n8 = sum(r * (k + QU.scale_bytes(k, "int8")) for r, k in            # int8x's rows
+             ((r, -(-c // 128) * 128) for r, c in shapes.values()))
+    head = 1000 * (QU.row_bytes(256, "fp4") + QU.scale_bytes(256, "fp4"))
+    assert by["int8"] - n8 == head and by["int8"] > by["attn"] > 0
+    assert FS._g4_spans(spec) == [(0, 2), (3, 5)]
+    big = replace(spec, kinds=((G.SLIDE,) * 5 + (G.FULL,)) * 5, kv_src=tuple(range(30)),
+                  ffn=(2112,) * 30)
+    assert FS._g4_spans(big) == [(0, 11), (12, 29)]
+
+
+def test_moe_experts_gain_with_outliers(moe_g2):
+    """The experts read the norm times pre_feedforward_layernorm_2's gain, quantized (moe_ffn's
+    g_exp), not the norm with the gain folded into W_gate's and W_up's columns: with 4 channels
+    at 8x, the folded gain coarsens every other column's int8 block (median cosine with HF
+    0.977); unfolded the int8 device follows HF as with a plain gain (0.994; 0.987 in the MX
+    MXU's int8x, whose blocks' power-of-two scales flip a routing more: 0.991 with a plain
+    gain, against 0.998)."""
+    m, W, spec = moe_g2
+    toks = [int(t) for t in np.random.default_rng(1).integers(0, 1000, 12)]
+    with torch.no_grad():
+        hf = m(torch.tensor([toks])).logits[0].numpy()
+    eng = _moe_engine(moe_g2)
+    dev = np.array([G.softcap(spec, eng.step(t)) for t in toks])
+    assert np.median(_cos(dev, hf)) > 0.985
+
+
+@pytest.mark.parametrize("wf,hf,formats", [("int8", None, ""), ("fp4", None, ""),
+                                           ("int8", "fp4", "experts=nvfp4")])
+def test_moe_small_cache_is_bit_exact(moe, wf, hf, formats):
+    """k slots per layer: nearly every request misses and streams (while the dense MLP runs
+    beside it); the logits do not move. The 26B's formats on the card too (int8 layers, nvfp4
+    experts, an fp4 head: streamed.FORMATS)."""
+    m, W, spec = moe
+    moe = (m, W, G.replace(spec, formats=formats))
+    toks = [int(t) for t in np.random.default_rng(2).integers(0, 1000, 10)]
+    full = _moe_engine(moe, wformat=wf, head_format=hf)
+    assert full.image.efmt == (formats[8:] if formats else wf)
+    ref = np.array([full.step(t) for t in toks])
+    small = _moe_engine(moe, wformat=wf, head_format=hf, experts=K)
+    got = np.array([small.step(t) for t in toks])
+    assert small.server.misses > len(toks)
+    assert np.array_equal(got.view(np.uint32), ref.view(np.uint32))
+
+
+@pytest.mark.parametrize("R,tag_first", [(1, False), (2, False), (2, True)])
+def test_moe_streams_beat_by_beat(moe, R, tag_first):
+    """docs/offload.md 10.11 over an adversarial link (tests/beat_link.py: the server's writes
+    land a 64-byte beat at a time, the machine running as soon as one of its WAITWs holds): k
+    slots per layer (2k for runs of 2 rows), the dense MLP beside each request and, with
+    R = 2, the prompt layer by layer (moe.moe_ffn_rows: one request for the run's rows, each
+    union expert's slot at its first place in the answer), give the logits of the engine with
+    every expert in a slot bit for bit, then the next decode steps. The negative control (each
+    tag before its expert's bytes) breaks the prefill's."""
+    from beat_link import BeatLink
+    toks = [int(t) for t in np.random.default_rng(3).integers(0, 1000, 9)]
+    full = _moe_engine(moe, wformat="fp4")
+    small = _moe_engine(moe, wformat="fp4", experts=R * K, layer_major=R if R > 1 else 0)
+    link = BeatLink(small, tag_first)
+    la, lb = small.prefill(toks), full.prefill(toks)
+    if tag_first:
+        assert not np.array_equal(la.view(np.uint32), lb.view(np.uint32))
+        return
+    assert np.array_equal(la.view(np.uint32), lb.view(np.uint32))
+    t = int(np.argmax(la))
+    for _ in range(3):
+        ga, gb = small.step(t), full.step(t)
+        assert np.array_equal(ga.view(np.uint32), gb.view(np.uint32))
+        t = int(np.argmax(ga))
+    assert small.server.misses > len(toks) and link.held > 0
+
+
+def test_moe_resident_and_the_card_loop(moe):
+    """Resident decode (the token's rows gathered on the device) gives the per-position
+    programs' logits bit for bit, with k slots per layer; the decode loop on the card (the
+    generate program) gives the host's resident loop token for token while the experts stream
+    between the tokens it picks."""
+    toks = [int(t) for t in np.random.default_rng(3).integers(0, 1000, 20)]
+    a = _moe_engine(moe, experts=K, resident=True)
+    b = _moe_engine(moe, experts=K)
+    assert a.resident and a.can_generate
+    la, lb = a.prefill(toks), b.prefill(toks)
+    assert np.array_equal(la.view(np.uint32), lb.view(np.uint32))
+    c = _moe_engine(moe, experts=K, resident=True)
+    c.prefill(toks)
+    ref, t = [], int(np.argmax(la))
+    t0 = t
+    for _ in range(8):
+        t = int(np.argmax(a.step(t)))
+        ref.append(t)
+    misses = c.server.misses
+    assert c.generate_card(t0, 8, stop_ids=[]) == ref
+    assert c.server.misses > misses
+
+
+def test_moe_on_board_model(moe, have_verilator):
+    """The MoE block on the RTL (WAITW) through the host driver, as test_lfm2_moe.py's: every
+    expert resident and `served` past any request, so each layer's fence and directory waits
+    hold at their first read. Per-position programs, then the resident decode, then the card's
+    generate loop (the experts beside the dense MLP, sliding and global attention): the ISA
+    simulator's logits and tokens bit for bit."""
+    from conftest import sim_board_config
+    from opentpu.host.board import Board, BoardBackend, SimTransport
+    _, W, spec = moe
+    cfg = sim_board_config(DRAM_BYTES=1 << 26)
+    tr = SimTransport(ch_bytes=cfg.DRAM_BYTES // 2, stall=20, seed=5)
+    assert Board(tr).info()["caps"].get("waitw"), "the board model has no WAITW (CAPS bit31)"
+    isa = _moe_engine(moe, cfg, resident=True)
+    brd = _moe_engine(moe, cfg, resident=True,
+                      backend=lambda c, imgs: BoardBackend(c, imgs, transport=tr))
+    assert brd.resident and brd.can_generate and brd.server.misses == 0
+    L = brd.image.offload
+    brd.backend.write(0, L.served, np.array([3e38], np.float32))
+    for tok in (11, 222, 333, 444):
+        a, b = isa.step(tok), brd.step(tok)
+        assert np.array_equal(a.view(np.uint32), b.view(np.uint32)), brd.pos
+    t0 = int(np.argmax(a))
+    assert brd.generate_card(t0, 4, stop_ids=[]) == isa.generate_card(t0, 4, stop_ids=[])
+    assert isa.server.misses == 0 and brd.stats[-1]["cycles"] > 0
+
+
+@pytest.mark.parametrize("wf,R", [("int8", 1), ("fp4", 1), ("fp4", 2), ("int8", 4)])
+def test_moe_layer_major_prefill_is_bit_exact(moe, wf, R, monkeypatch):
+    """The prompt layer by layer (Engine.prefill_layers: every row of a chunk through a layer
+    before the next, in runs of R rows at their run-time position and chunk row; R > 1: the
+    MoE block moe.moe_ffn_rows, one request for the run's rows; the slots pooled) gives the
+    logits and the KV cache of token-by-token runs bit for bit, with as few slots per layer
+    as a run's union can need: chunks of 100 rows, the last crossing an attention bucket
+    (runs split at the block's end); then the next decode steps."""
+    monkeypatch.setattr(G, "PREFILL_CHUNK", 100)
+    toks = [int(t) for t in np.random.default_rng(7).integers(0, 1000, 262)]
+    slots = min(8, R * K)
+    a = _moe_engine(moe, wformat=wf, experts=slots, layer_major=R)
+    b = _moe_engine(moe, wformat=wf, experts=slots)
+    assert a.image.prefill_rows == 100
+    la, lb = a.prefill(toks), b.prefill(toks)
+    assert a.pos == b.pos == len(toks)
+    assert np.array_equal(la.view(np.uint32), lb.view(np.uint32))
+    img = a.image
+    assert np.array_equal(a.backend.machine.slices[0].dram[img.layer0:img.head[0]],
+                          b.backend.machine.slices[0].dram[img.layer0:img.head[0]])
+    assert a.server.misses > 0 or slots == 8          # (R = 4: every expert in a slot)
+    t = int(np.argmax(la))
+    for _ in range(3):
+        ga, gb = a.step(t), b.step(t)
+        assert np.array_equal(ga.view(np.uint32), gb.view(np.uint32))
+        t = int(np.argmax(ga))
+
+
+@pytest.mark.parametrize("wf,R,C", [("int8", 2, None), ("fp4", 1, None), ("fp4", 2, None),
+                                    ("fp4", 2, 2), ("int8", 2, 3)])
+def test_moe_expert_major_prefill_is_bit_exact(moe, wf, R, C, monkeypatch):
+    """Expert-major MoE in the layer-major prefill (Engine(expert_major=True), docs/offload.md
+    13.11) on Gemma 4: each layer's runs route their rows, post the experts they chose as need
+    lines and run the dense MLP beside (normed, to the rows' records); then one expert run a
+    layer; the next layer's runs and the head end the layer (norm_2 of the experts' sum beside
+    the dense MLP's, the post-FFN norm and the layer scalar). The logits, the KV cache and the
+    decode steps after equal token by token's bit for bit: 40 tokens in chunks of 24 and 16
+    rows, 6 slots a layer behind the ExpertServer (each need landing while an expert run waits
+    on its entry, none left for end_prefill). C: the passes' entries (Engine.em_pass; None:
+    the configuration's, docs/offload.md 13.18)."""
+    from test_qwen35_moe import _scratch
+    monkeypatch.setattr(G, "PREFILL_CHUNK", 24)
+    toks = [int(t) for t in np.random.default_rng(13).integers(0, 1000, 40)]
+    a = _moe_engine(moe, wformat=wf, experts=6, layer_major=R, expert_major=True)
+    b = _moe_engine(moe, wformat=wf, experts=6)
+    a.em_pass = C
+    sc = _scratch(a.server, monkeypatch)
+    la, lb = a.prefill(toks), b.prefill(toks)
+    assert a.pos == b.pos == len(toks)
+    assert np.array_equal(la.view(np.uint32), lb.view(np.uint32))
+    srv = a.server
+    assert len(sc) == 1 and sc[0][0] == srv.L.slots[0][0] and sc[0][1]
+    assert sc[0][2] == a.ahead_part and srv.part != a.ahead_part     # (restored)
+    runs = sum(-(-n // R) for n in (24, 16))
+    assert srv.need_lines == len(KINDS) * runs
+    assert srv.needs_landed == srv.needs_queued > 0 and srv.drained == 0
+    assert not srv.scratch_slots and not srv.expert_major
+    img = a.image
+    assert np.array_equal(a.backend.machine.slices[0].dram[img.layer0:img.head[0]],
+                          b.backend.machine.slices[0].dram[img.layer0:img.head[0]])
+    t = int(np.argmax(la))
+    for _ in range(2):
+        ga, gb = a.step(t), b.step(t)
+        assert np.array_equal(ga.view(np.uint32), gb.view(np.uint32))
+        t = int(np.argmax(ga))
+
+
+def test_moe_layer_runs_hint_the_next_layer_and_change_no_logit(moe):
+    """Engine(layer_ahead="hint") on Gemma 4: each layer run but the last layer's ends with the
+    next layer's hint (moe.moe_hint_rows: its router, through its norm and scale, on the run's
+    output rows); the logits and decode steps of token-by-token runs bit for bit. With the
+    attention's output projections zero (its norm of 0 adds 0) a layer's route reads the
+    layer's input, so each hint is the next layer's request for the same rows, in order: 21
+    rows in runs of 2, the last of 1."""
+    _, W, spec = moe
+    toks = [int(t) for t in np.random.default_rng(8).integers(0, 1000, 21)]
+    a = _moe_engine(moe, experts=2 * K, layer_major=2, layer_ahead="hint")
+    b = _moe_engine(moe, experts=2 * K)
+    la, lb = a.prefill(toks), b.prefill(toks)
+    L, runs = len(KINDS), 11
+    assert a.server.hints == (L - 1) * runs and a.server.aheads == L
+    assert np.array_equal(la.view(np.uint32), lb.view(np.uint32))
+    t = int(np.argmax(la))
+    for _ in range(3):
+        ga, gb = a.step(t), b.step(t)
+        assert np.array_equal(ga.view(np.uint32), gb.view(np.uint32))
+        t = int(np.argmax(ga))
+    W0 = {k: (np.zeros_like(v) if k.endswith("self_attn.o_proj.weight") else v)
+          for k, v in W.items()}
+    z = Engine(spec, W0, cap=1024, cfg=_cfg(), rows=1, experts=2 * K, layer_major=2,
+               layer_ahead="hint")
+    srv, hints, mark = z.server, [], []
+    hint, begin = srv.hint, srv.begin_prefill
+    srv.hint = lambda ids: (hints.append(list(ids)), hint(ids))
+    srv.begin_prefill = lambda **kw: (begin(**kw), mark.append(len(srv.history)))
+    srv.history = []
+    z.prefill(toks)
+    got = srv.history[mark[0]:]
+    assert len(got) == L * runs and len(hints) == (L - 1) * runs
+    assert hints == got[runs:] and any(len(h) > K for h in hints)
+
+
+@pytest.mark.parametrize("restore", ["lazy", "eager"])
+def test_moe_pooled_slots_cut_the_prompts_misses(moe, restore):
+    """Layer-major prefill with the slots pooled (ExpertServer.begin_prefill / end_prefill:
+    every slot serves the running layer, then each layer gets its own number back, `restore`)
+    against each layer's own slots: the same logits and decode steps bit for bit, under half
+    the misses in the prompt, and every layer back to its own number of slots."""
+    toks = [int(t) for t in np.random.default_rng(8).integers(0, 1000, 60)]
+    a = _moe_engine(moe, experts=2 * K, layer_major=2, restore=restore)
+    b = _moe_engine(moe, experts=2 * K, layer_major=2, pooled=False)
+    la, lb = a.prefill(toks), b.prefill(toks)
+    assert np.array_equal(la.view(np.uint32), lb.view(np.uint32))
+    assert 0 < 2 * a.server.misses < b.server.misses
+    srv = a.server
+    assert not srv.pooled and all(len(srv.lru[j]) + len(srv.free[j]) == n
+                                  for j, (_, n) in enumerate(a.image.offload.slots))
+    t = int(np.argmax(la))
+    for _ in range(3):
+        ga, gb = a.step(t), b.step(t)
+        assert np.array_equal(ga.view(np.uint32), gb.view(np.uint32))
+        t = int(np.argmax(ga))
+
+
+@pytest.mark.parametrize("wf, em", [("int8", False), ("fp4", True)])
+def test_waits_memo_is_exact_on_its_programs(moe, wf, em, monkeypatch):
+    """The waits pass's memoized entries (opentpu/waits.py _MemoPass) are the exact pass's on
+    every program Gemma 4 26B-A4B's parts run streamed from 6 slots a layer: the layer runs
+    (layer-major, sliding and global layers), expert-major's expert runs (em), the step and
+    resident decode programs, the decode loop's (GEN, RLD). Their MMs drain at their array's
+    rate (compiler.slow_drains)."""
+    from conftest import assert_drains_keep_up, assert_waits_exact, waits_programs
+    monkeypatch.setattr(G, "PREFILL_CHUNK", 24)
+    toks = [int(t) for t in np.random.default_rng(13).integers(0, 1000, 40)]
+    e = _moe_engine(moe, wformat=wf, experts=6, layer_major=2, expert_major=em, resident=True)
+    progs = waits_programs(e)
+    e.prefill(toks[:30])
+    e.step(toks[30])
+    e.generate_card(toks[31], 6, stop_ids=[])
+    assert e._layer_runs and any(k[0] == "x" for k in e._layer_runs) == em
+    assert len(progs) >= 4 and assert_waits_exact(progs, e.cfg) > 1000
+    assert assert_drains_keep_up(progs, e.cfg) > 0
+
+
+def test_moe_layer_major_prefill_on_a_live_card(moe):
+    """Layer-major prefill through the card's driver (BoardBackend: each run started with its
+    arguments; a layer's program assembled once and loaded once a chunk, its runs starting the
+    program already in IMEM) beside a card that computes while the host serves
+    (tests/test_lfm2_moe.py's _LiveCard): R = 2 with 2k slots per layer, 21 rows (each layer's
+    last run one row), the misses served during the runs, gives the ISA simulator's
+    token-by-token logits bit for bit."""
+    from test_lfm2_moe import _LiveCard
+    from opentpu.host.board import BoardBackend
+    _, W, spec = moe
+    cfg = _cfg()
+    card = _LiveCard.make(cfg)
+    kw = dict(cap=1024, cfg=cfg, rows=1, resident=True, experts=2 * K)
+    isa = Engine(spec, W, **kw)
+    brd = Engine(spec, W, **kw, layer_major=2,
+                 backend=lambda c, imgs: BoardBackend(c, imgs, transport=card))
+    loads, load = [], brd.backend.board.load_program
+    brd.backend.board.load_program = lambda a, w: (loads.append(len(w)), load(a, w))
+    toks = [int(t) for t in np.random.default_rng(9).integers(0, 1000, 21)]
+    la, lb = isa.prefill(toks), brd.prefill(toks)
+    assert card.error is None, card.error
+    assert np.array_equal(la.view(np.uint32), lb.view(np.uint32))
+    assert brd.server.misses > 0    # (card.waits may be 0: the host can write an entry before
+                                    # the card's thread reaches its WAITW)
+    assert len(loads) == 2 * spec.layers + 2        # the embed run's, each layer's two
+                                                    # (2 rows, then 1), the head's
+    t = int(np.argmax(la))
+    a, b = isa.step(t), brd.step(t)
+    assert card.error is None, card.error
+    assert np.array_equal(a.view(np.uint32), b.view(np.uint32))
+
+
+def test_moe_lfu_policy_is_bit_exact(moe):
+    """The slots replaced by least decayed use (moe.serve's default, ExpertServer policy "lfu")
+    or by LRU, 4 slots of 8 per layer: other misses, the full cache's logits bit for bit."""
+    toks = [int(t) for t in np.random.default_rng(10).integers(0, 1000, 16)]   # (MX: LFU 59,
+    full = _moe_engine(moe)                                                    # LRU 63 misses)
+    ref = np.array([full.step(t) for t in toks])
+    misses = {}
+    for policy in ("lru", "lfu"):
+        eng = _moe_engine(moe, experts=4)
+        assert eng.server.policy == "lfu"
+        eng.server.policy = policy
+        got = np.array([eng.step(t) for t in toks])
+        assert np.array_equal(got.view(np.uint32), ref.view(np.uint32)), policy
+        misses[policy] = eng.server.misses
+    assert misses["lfu"] > len(toks) and misses["lfu"] != misses["lru"]
+
+
+def test_moe_live_card_streams_from_a_split_pool(moe, tmp_path):
+    """The host's side of path (a) as it runs beside a card (tests/test_lfm2_moe.py's
+    _LiveCard: a fake card computing in a thread over the host's DRAM, with CHASH's channel
+    map), k slots per layer: the experts come from a pool file in the split format, read into
+    the channel runs and written by BoardDram's DMA thread while the card's MoE layers wait.
+    Resident steps and the card's generate loop give the ISA simulator's logits and tokens bit
+    for bit, with misses served during the runs."""
+    from test_lfm2_moe import _LiveCard, _wait_first
+    from opentpu.host.board import BoardBackend
+    from opentpu.host.offload import BoardDram
+    _, W, spec = moe
+    cfg = _cfg()
+    card = _LiveCard.make(cfg, chash=True)
+    card.threaded = True
+    kw = dict(cap=1024, cfg=cfg, rows=1, resident=True, experts=K)
+    isa = Engine(spec, W, **kw)
+    brd = Engine(spec, W, **kw, backend=lambda c, imgs: BoardBackend(c, imgs, transport=card),
+                 pool_file=tmp_path / "pool.bin")
+    assert brd.backend.board.chash and brd.can_generate and brd.backend.host is not None
+    assert isinstance(brd.server.mem, BoardDram) and brd.server.pool_file.split
+    again = _wait_first(card, brd.server)   # (card.waits whatever the host's speed)
+    toks = [int(t) for t in np.random.default_rng(8).integers(0, 1000, 6)]
+    for t in toks:
+        a, b = isa.step(t), brd.step(t)
+        assert card.error is None, card.error
+        assert np.array_equal(a.view(np.uint32), b.view(np.uint32)), brd.pos
+    assert brd.server.misses > len(toks) and card.waits > 0
+    t0, misses, waits = int(np.argmax(a)), brd.server.misses, card.waits
+    again()
+    got = brd.generate_card(t0, 8, stop_ids=[])
+    assert card.error is None, card.error
+    assert got == isa.generate_card(t0, 8, stop_ids=[])
+    assert brd.server.misses > misses and card.waits > waits      # served during the loop
+    assert brd.server.misses == isa.server.misses
+    # every expert read into its runs: each slot on a RUN block (Layout's pitch; direct
+    # counts the load's experts too)
+    assert brd.server.mem.direct >= brd.server.misses > 0 and brd.server.pool_warm
+
+
+def test_moe_formats(moe):
+    """experts=fmt sets the experts' format (one slot size for every layer); a range is
+    refused; the router stays int8."""
+    _, W, spec = moe
+    assert G.expert_format(spec, "int8", "experts=fp4") == "fp4"
+    assert G.expert_format(spec, "fp4", "") == "fp4"
+    with pytest.raises(ValueError, match="per layer range"):
+        G.expert_format(spec, "int8", "experts@0-2=fp4")
+    img = spec.image(_cfg(), 1024, rows=1, formats="experts=fp4", experts=K)
+    assert img.efmt == "fp4" and img.lf[0] == ("int8",) * 4
+    assert img.offload.slots[0][1] == K
+
+
+def _quant_eval():
+    import importlib.util
+    from pathlib import Path
+    path = Path(__file__).resolve().parent.parent / "tools" / "gemma4_quant_eval.py"
+    s = importlib.util.spec_from_file_location("gemma4_quant_eval", path)
+    mod = importlib.util.module_from_spec(s)
+    s.loader.exec_module(mod)
+    return mod
+
+
+def test_quant_eval_emulation(kv, moe, moe_g2):
+    """tools/gemma4_quant_eval.py's batched emulation of these models: with float weights it is
+    reference_logits (the MoE's folds exact); int8 and fp4 equal emulated_logits (up to
+    rounding ties), the MoE's too (its two inputs: the router's, the experts' with the gain
+    with outliers); its MoE block in int8 (weights and activations) is within the dense MLP's
+    error of the reference block (~2%)."""
+    from opentpu.llm.qwen3 import _fake_q, _fake_w
+    Q = _quant_eval()
+    toks = [int(t) for t in np.random.default_rng(3).integers(0, 1000, 20)]
+    for m in (kv, moe):
+        _, W, spec = m
+        ref = G.reference_logits(spec, W, toks)
+        assert np.abs(Q.emulate(spec, W, toks, wformat="none") - ref).max() < 1e-3
+    for m in (kv, moe, moe_g2):
+        _, W, spec = m
+        for wf in ("int8", "fp4"):
+            a = Q.emulate(spec, W, toks, wformat=wf)
+            b = G.emulated_logits(spec, W, toks, wformat=wf)
+            assert np.abs(a - b).max() < 1e-3 * np.abs(b).max()
+    _, W, spec = moe
+    x = np.random.default_rng(5).standard_normal((64, 256)).astype(np.float32) * 3
+    p = "model.layers.3."
+    ref = G._moe(spec, W, p, x)
+
+    def wq(n, fmt="int8", a=None, cols=None):
+        a = np.asarray(W[n] if a is None else a, np.float32)
+        cols = cols or -(-a.shape[1] // 128) * 128
+        return _fake_w(np.pad(a, ((0, 0), (0, cols - a.shape[1]))), 128, fmt)
+
+    fq = lambda v, d=128, n=None: _fake_q(np.asarray(v, np.float64), d, n)     # noqa: E731
+    padq = lambda v, n, C: fq(np.pad(v, ((0, 0), (0, n - v.shape[1]))), 128, C)  # noqa: E731
+    out = Q._moe(spec, W, p, x, wq, fq, padq, False, lambda n: "int8")
+    assert (np.linalg.norm(out - ref, axis=1) / np.linalg.norm(ref, axis=1)).max() < 0.04
+
+
+def test_quant_eval_resumes(moe, tmp_path):
+    """tools/gemma4_quant_eval.py's checkpoint: a run stopped inside a layer (killed at the
+    memory floor) resumes after the last layer it finished, with the same logits."""
+    Q = _quant_eval()
+    _, W, spec = moe
+    toks = [int(t) for t in np.random.default_rng(3).integers(0, 1000, 20)]
+    want = Q.emulate(spec, W, toks, wformat="fp4")
+    ck, moe_block, seen = tmp_path / "ck.npz", Q._moe, []
+
+    def stop(spec_, W_, p, *a):
+        seen.append(p)
+        if len(seen) == 3:
+            raise KeyboardInterrupt
+        return moe_block(spec_, W_, p, *a)
+    Q._moe = stop
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            Q.emulate(spec, W, toks, wformat="fp4", ckpt=str(ck))
+    finally:
+        Q._moe = moe_block
+    with np.load(ck) as z:
+        assert int(z["layer"]) == 1
+    assert np.array_equal(Q.emulate(spec, W, toks, wformat="fp4", ckpt=str(ck)), want)
+    assert not np.array_equal(Q.emulate(spec, W, toks, wformat="int8", ckpt=str(ck)), want)
+
+
+def test_moe_compile_worker_builds_the_image(moe):
+    """The compile worker process (the card's backend compiles ahead in it) builds the
+    engine's image, its K expert slots per layer included, and the same programs."""
+    from opentpu import isa as I
+    from opentpu.llm import qwen3 as Q
+    _, W, spec = moe
+    eng = _moe_engine(moe, experts=K, resident=True)
+    Q._worker_init(spec, eng.cfg, eng.cap, eng.batch, eng.rows, eng.block, eng._image_kw)
+    try:
+        img = Q._WORKER[0]
+        assert img.nbytes == eng.image.nbytes and img.offload == eng.image.offload
+        words, _ = Q._worker_decode(1, 2)
+        assert np.array_equal(words, I.assemble(eng.image.compile_decode(1, 2)[0][0]))
+    finally:
+        Q._WORKER = None
